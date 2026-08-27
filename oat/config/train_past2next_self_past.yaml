@@ -22,8 +22,10 @@ _target_: oat.workspace.train_policy.TrainPolicyWorkspace
 seed: 42
 # horizon: 32
 horizon: 16
+# horizon: 64
 # n_action_steps: 16
 n_action_steps: 8
+# n_action_steps: 32
 n_obs_steps: 2
 past_n: 7
 task_name: ${task.policy.name}
@@ -59,7 +61,9 @@ policy:
   # backbone model params
   embed_dim: 256
   n_layers: 4
+  # n_layers: 8
   n_heads: 4
+  # n_heads: 8
   dropout: 0.1
   # policy inference params
   temperature: 1.0
@@ -68,10 +72,12 @@ policy:
   # self-generated past params
   # 1.0 = always use the policy's own past (the intended experiment);
   # lower values mix with ground truth, scheduled-sampling style.
-  self_past_p: 1.0
+  # self_past_p: 1.0
+  self_past_p: 0.5
   # Steps of ground-truth past before substitution starts, so the policy is
   # not conditioned on the output of a randomly-initialised model.
-  self_past_warmup_steps: 500
+  # self_past_warmup_steps: 500
+  self_past_warmup_steps: 1000
   # null -> reuse policy temperature / topk (what rollout actually uses)
   self_past_temperature: null
   self_past_topk: null

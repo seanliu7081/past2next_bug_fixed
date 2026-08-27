@@ -7,6 +7,7 @@ _target_: oat.workspace.train_oattok.TrainOATTokWorkspace
 
 seed: 42
 horizon: 16
+# horizon: 64
 task_name: ${task.tokenizer.name}
 action_dim: ${task.tokenizer.shape_meta.action.shape[0]}
 
