@@ -48,6 +48,7 @@ The original audit reportedly covered episode counts, unique indices, task balan
 protocol schedules, checkpoint/tokenizer identities, source hashes and inference
 settings. Use the source archives to recheck those claims.
 
-See [README.md](README.md) for retained configs, known recipe overrides and evaluation
-commands. The generic fine-tuning config requires explicit crop/LR overrides for 015;
-it is not itself the complete historical 015 recipe.
+See [README.md](README.md) for the current two-stage workflow: train a tokenizer,
+then freeze it and train a policy from scratch. The standalone scratch recipes keep
+the 015/043/046 designs but do not initialize from the historical policy checkpoints.
+The settings and scores above describe the original fine-tuning runs.

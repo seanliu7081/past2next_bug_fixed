@@ -145,19 +145,21 @@ def test_actual_loss_gradient_update_ema_and_five_group_roundtrip():
         restored_optimizer.load_state_dict(slow_optimizer.state_dict())
 
 
-def test_config_matches_approved_controlled_branch():
+def test_config_preserves_task_residual_variant_with_scratch_defaults():
     register_new_resolvers()
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / 'oat/config'), version_base=None):
-        cfg=compose(config_name='train_past2next_finetune_tasklr')
+        cfg=compose(config_name='train_past2next_scratch_tasklr')
     assert cfg.policy._target_.endswith('.Past2NextSelfPastTaskLRPolicy')
     assert cfg.policy.obs_encoder._target_.endswith('.TaskResidualFusedObservationEncoder')
-    assert cfg.training.init_checkpoint.endswith('015_finetune112_greedy_history/checkpoints/ep-0009.ckpt')
-    assert cfg.training.init_weights == 'ema' and not cfg.training.resume
-    assert not cfg.training.init_allow_spatial_resize and cfg.training.num_epochs == 10
+    assert cfg.training.init_checkpoint is None
+    assert not cfg.training.resume and not cfg.logging.resume
+    assert 'init_weights' not in cfg.training and 'init_allow_spatial_resize' not in cfg.training
+    assert cfg.training.num_epochs == 251
     assert list(cfg.policy.obs_encoder.vision_encoder.crop_shape) == [112,112]
     assert cfg.optimizer.task_residual_lr == 1e-3 and cfg.optimizer.policy_lr == 1e-5 and cfg.optimizer.obs_enc_lr == 2e-6
     assert cfg.policy.self_past_temperature == 1 and cfg.policy.temperature == 0
     assert cfg.policy.self_past_warmup_steps == 1000 and cfg.policy.self_past_ramp_steps == 4000
     assert cfg.task.policy.dataset.val_ratio == .1 and cfg.task.policy.dataset.seed == 42
     assert cfg.training.max_val_steps is None and not cfg.val_dataloader.drop_last
-    assert cfg.training.snapshot_every == 1 and cfg.policy.past_n == 7
+    assert cfg.training.checkpoint_every == cfg.training.snapshot_every == 25
+    assert cfg.policy.past_n == 7

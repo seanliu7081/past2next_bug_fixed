@@ -254,19 +254,28 @@ def test_table_receives_finite_gradients_optimizer_updates_and_ema():
 
 
 
-def test_retained_branches_share_policy_shape_and_initialization():
+def test_retained_branches_share_policy_shape_and_scratch_initialization():
     register_new_resolvers()
     directory = str(Path(__file__).resolve().parents[1] / 'oat/config')
     with initialize_config_dir(config_dir=directory, version_base=None):
-        all500 = compose(config_name='train_past2next_finetune_all500')
-        tasklr = compose(config_name='train_past2next_finetune_tasklr')
-    for cfg in (all500, tasklr):
+        scratch = compose(config_name='train_past2next_scratch')
+        all500 = compose(config_name='train_past2next_scratch_all500')
+        tasklr = compose(config_name='train_past2next_scratch_tasklr')
+    for cfg in (scratch, all500, tasklr):
+        assert OmegaConf.is_missing(cfg.policy.action_tokenizer, 'checkpoint')
         assert cfg.policy.n_layers == cfg.policy.n_heads == 8
         assert cfg.policy.past_n == 7
         assert list(cfg.policy.obs_encoder.vision_encoder.crop_shape) == [112, 112]
-        assert cfg.training.init_weights == 'ema' and not cfg.training.resume
-        assert cfg.policy.self_past_temperature == 1
-    assert all500.training.init_checkpoint == tasklr.training.init_checkpoint
+        assert cfg.training.init_checkpoint is None
+        assert not cfg.training.resume and not cfg.logging.resume
+        assert 'init_weights' not in cfg.training and 'init_allow_spatial_resize' not in cfg.training
+        assert cfg.training.num_epochs == 251
+        assert cfg.training.checkpoint_every == cfg.training.snapshot_every == 25
+        assert cfg.policy.self_past_warmup_steps == 1000 and cfg.policy.self_past_ramp_steps == 4000
+    assert scratch.policy.self_past_temperature == 0
+    assert scratch.optimizer.policy_lr == scratch.optimizer.obs_enc_lr == 1e-5
+    assert scratch.task.policy.dataset.val_ratio == .1
+    assert all500.policy.self_past_temperature == tasklr.policy.self_past_temperature == 1
     assert all500.task.policy.dataset.val_ratio == 0
     assert tasklr.task.policy.dataset.val_ratio == .1
     assert all500.policy.obs_encoder._target_.endswith('.FusedObservationEncoder')

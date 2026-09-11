@@ -1,4 +1,4 @@
-"""CPU training-loop regressions for explicit no-holdout refinement.
+"""CPU training-loop regressions for scratch runs and explicit no-holdout training.
 
 Historical dataset-only fixtures with val_ratio=0 remain valid. Any diagnostic
 that actually calls TrainPolicyWorkspace.run with zero validation windows must
@@ -73,12 +73,11 @@ class TinyPolicy(torch.nn.Module):
         return {'action_pred': self.weight.expand_as(obs['value'])}
 
 
-def config():
+def config(config_name='train_past2next_scratch'):
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / 'oat/config'), version_base=None):
-        cfg = compose(config_name='train_past2next_finetune')
+        cfg = compose(config_name=config_name)
     cfg.policy = {'_target_': 'test.TinyPolicy'}
     cfg.task.policy.dataset = {'_target_': 'test.TinyDataset'}
-    cfg.training.init_checkpoint = None
     cfg.training.use_ema = False
     cfg.training.allow_bf16 = False
     cfg.training.num_epochs = 1
@@ -125,6 +124,46 @@ def run_tiny(tmp_path, monkeypatch, cfg, validation_length=2, forbid_validation=
     assert all(math.isfinite(float(value)) for row in rows for value in row.values()
                if isinstance(value, (int, float)))
     return workspace, policy, dataset, rows[-1]
+
+
+@pytest.mark.parametrize('config_name, validation_length, validation_enabled', [
+    ('train_past2next_scratch', 2, True),
+    ('train_past2next_scratch_all500', 0, False),
+    ('train_past2next_scratch_tasklr', 2, True),
+])
+def test_scratch_defaults_train_with_fresh_progress_despite_existing_checkpoint(
+        tmp_path, monkeypatch, config_name, validation_length, validation_enabled):
+    cfg = config(config_name)
+    assert cfg.training.init_checkpoint is None
+    assert cfg.training.resume is False and cfg.logging.resume is False
+    stale_checkpoint = tmp_path / 'checkpoints/latest.ckpt'
+    stale_checkpoint.parent.mkdir()
+    stale_checkpoint.write_bytes(b'Invalid checkpoint from an earlier run')
+
+    def forbid_checkpoint_load(*args, **kwargs):
+        pytest.fail('Scratch defaults must not initialize or resume policy weights')
+
+    monkeypatch.setattr(TrainPolicyWorkspace, '_initialize_policy_weights', forbid_checkpoint_load)
+    monkeypatch.setattr(TrainPolicyWorkspace, '_resume_training_checkpoint', forbid_checkpoint_load)
+    workspace, policy, dataset, row = run_tiny(
+        tmp_path, monkeypatch, cfg, validation_length,
+        forbid_validation=not validation_enabled)
+    assert policy.training_calls == 2
+    assert policy.weight.item() < 0.5
+    assert (workspace.epoch, workspace.global_step, workspace.completed_optimizer_steps) == (1, 2, 2)
+    assert workspace.resume_migration is None
+    assert len(workspace.optimizer.state) == 1
+    assert all(int(state['step']) == 2 for state in workspace.optimizer.state.values())
+    assert workspace.lr_scheduler_state['last_epoch'] == 2
+    assert row['offline_validation_enabled'] == int(validation_enabled)
+    assert policy.validation_calls == policy.reconstruction_calls == int(validation_enabled)
+    assert dataset.validation.reads == (4 if validation_enabled else 0)
+    payload = torch.load(tmp_path / 'checkpoints/ep-0000.ckpt', map_location='cpu',
+                         pickle_module=dill, weights_only=False)
+    assert dill.loads(payload['pickles']['epoch']) == 1
+    assert dill.loads(payload['pickles']['completed_optimizer_steps']) == 2
+    assert dill.loads(payload['pickles']['global_step']) == 2
+    assert all(int(state['step']) == 2 for state in payload['state_dicts']['optimizer']['state'].values())
 
 
 def test_default_nonempty_validation_and_reconstruction_still_run(tmp_path, monkeypatch):
@@ -185,17 +224,19 @@ def test_nonempty_validation_with_all_batches_dropped_is_rejected():
 
 def test_all500_config_and_real_lightweight_dataset_preserve_temporal_contract():
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / 'oat/config'), version_base=None):
-        cfg = compose(config_name='train_past2next_finetune_all500')
+        cfg = compose(config_name='train_past2next_scratch_all500')
     assert cfg.policy._target_ == 'oat.policy.past2next_self_past.Past2NextSelfPastPolicy'
     assert cfg.policy.n_layers == cfg.policy.n_heads == 8
     assert cfg.policy.past_n == 7 and cfg.n_obs_steps == 2 and cfg.n_action_steps == 8 and cfg.horizon == 16
     assert cfg.policy.self_past_temperature == 1 and cfg.policy.temperature == 0
     assert list(cfg.policy.obs_encoder.vision_encoder.crop_shape) == [112, 112]
-    assert cfg.policy.action_tokenizer.checkpoint.endswith('ep-4960_mse-0.001.ckpt')
-    assert cfg.training.init_checkpoint.endswith('015_finetune112_greedy_history/checkpoints/ep-0009.ckpt')
-    assert cfg.training.init_weights == 'ema' and not cfg.training.resume
-    assert cfg.training.num_epochs == 10 and cfg.training.snapshot_every == 1
-    assert not cfg.training.init_allow_spatial_resize and not cfg.training.offline_validation_enabled
+    assert OmegaConf.is_missing(cfg.policy.action_tokenizer, 'checkpoint')
+    assert cfg.training.init_checkpoint is None
+    assert not cfg.training.resume and not cfg.logging.resume
+    assert cfg.training.num_epochs == 251
+    assert cfg.training.checkpoint_every == cfg.training.snapshot_every == 25
+    assert 'init_weights' not in cfg.training and 'init_allow_spatial_resize' not in cfg.training
+    assert not cfg.training.offline_validation_enabled
     assert cfg.training.offline_validation_reason and cfg.task.policy.lazy_eval
     assert cfg.optimizer.policy_lr == cfg.optimizer.obs_enc_lr == 1e-5
     assert cfg.task.policy.dataset.val_ratio == 0 and cfg.task.policy.dataset.max_train_episodes is None

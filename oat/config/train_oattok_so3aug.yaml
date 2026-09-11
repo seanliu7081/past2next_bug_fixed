@@ -62,7 +62,7 @@ tokenizer:
 
 
 training:
-  resume: True
+  resume: False
   allow_bf16: True
   max_grad_norm: 1.0
   num_epochs: 5001
@@ -111,7 +111,7 @@ val_dataloader:
 
 logging:
   project: oat_dev
-  resume: True
+  resume: False
   mode: online
   name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_N${training.num_demo}
   tags: ["${name}", "${task_name}"]

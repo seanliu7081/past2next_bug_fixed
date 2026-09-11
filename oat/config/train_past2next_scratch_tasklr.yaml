@@ -1,13 +1,11 @@
 defaults:
-  - _self_
   - task/policy: libero/libero10_with_prev_window
+  - _self_
 
-name: train_past2next_self_past
+name: train_past2next_scratch_tasklr
 _target_: oat.workspace.train_policy.TrainPolicyWorkspace
 
-# Standalone self-past policy configuration.
-# Training can substitute generated history from the previous observation window.
-# Each other training config explicitly declares its own complete recipe.
+# 046 design: fresh policy/vision weights and a zero task residual with its own learning rate.
 
 seed: 42
 horizon: 16
@@ -18,77 +16,59 @@ task_name: ${task.policy.name}
 shape_meta: ${task.policy.shape_meta}
 
 policy:
-  _target_: oat.policy.past2next_self_past.Past2NextSelfPastPolicy
-
+  _target_: oat.policy.past2next_task_lr.Past2NextSelfPastTaskLRPolicy
   shape_meta: ${shape_meta}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
   past_n: ${past_n}
-
   obs_encoder:
-    _target_: oat.perception.fused_obs_encoder.FusedObservationEncoder
-    _recursive_: false
+    _target_: oat.perception.task_residual_fused_obs_encoder.TaskResidualFusedObservationEncoder
+    _recursive_: False
     shape_meta: ${shape_meta}
-
-# baseline obs encoder params
     vision_encoder:
       _target_: oat.perception.robomimic_vision_encoder.RobomimicRgbEncoder
-      crop_shape: [76, 76]
-# ---------------------------------------------------------------------
-
+      crop_shape: [112, 112]
     state_encoder:
       _target_: oat.perception.state_encoder.ProjectionStateEncoder
       out_dim: null
-
   action_tokenizer:
     _target_: oat.tokenizer.oat.tokenizer.OATTok.from_checkpoint
     checkpoint: ???  # Stage 1 tokenizer checkpoint; required for Stage 2.
-
-  # backbone model params
   embed_dim: 256
-  n_layers: 4
-  # n_layers: 8
-  n_heads: 4
-  # n_heads: 8
+  n_layers: 8
+  n_heads: 8
   dropout: 0.1
-  # policy inference params
-  temperature: 1.0
+  temperature: 0.0
   topk: 10
-
-  # self-generated past params
-  # 1.0 = always use the policy's own past (the intended experiment);
-  # lower values mix with ground truth, scheduled-sampling style.
-  # self_past_p: 1.0
   self_past_p: 0.5
-  # Steps of ground-truth past before substitution starts, so the policy is
-  # not conditioned on the output of a randomly-initialised model.
-  # self_past_warmup_steps: 500
   self_past_warmup_steps: 1000
-  # null -> reuse policy temperature / topk (what rollout actually uses)
-  self_past_temperature: null
-  self_past_topk: null
+  self_past_temperature: 1.0
+  self_past_topk: 10
+  self_past_schedule: optimizer_step
+  self_past_ramp_steps: 4000
 
 training:
   resume: False
-  init_checkpoint: null
   allow_bf16: True
   max_grad_norm: 1.0
-  num_epochs: 5001
-  val_every: 10
-  sample_every: 10
-  rollout_every: 200
-  # rollout_every: 100
-  checkpoint_every: 10
-  lr_scheduler: constant
+  num_epochs: 251
+  val_every: 1
+  sample_every: 1
+  rollout_every: 25
+  checkpoint_every: 25
+  lr_scheduler: cosine
   lr_warmup_steps: 100
   gradient_accumulate_every: 1
   max_train_steps: null
   max_val_steps: null
-  max_reconst_steps: null
+  max_reconst_steps: 10
   seed: ${seed}
   use_ema: True
   num_demo: 500
   tqdm_interval_sec: 1.0
+  init_checkpoint: null
+  snapshot_every: 25
+  validate_generated_history: True
 
 ema:
   _target_: oat.model.diffusion.ema_model.EMAModel
@@ -99,14 +79,15 @@ ema:
   max_value: 0.9999
 
 optimizer:
-  policy_lr: 5.0e-5
-  obs_enc_lr: 1.0e-5
-  weight_decay: 0.0
+  policy_lr: 1.0e-05
+  obs_enc_lr: 2.0e-06
+  weight_decay: 0.0001
   betas: [0.9, 0.95]
+  task_residual_lr: 0.001
 
 dataloader:
   batch_size: 64
-  num_workers: 2
+  num_workers: 4
   shuffle: True
   pin_memory: True
   persistent_workers: True
@@ -118,14 +99,26 @@ val_dataloader:
   shuffle: False
   pin_memory: True
   persistent_workers: True
-  drop_last: True
+  drop_last: False
+
+task:
+  policy:
+    lazy_eval: True
+    dataset:
+      history_padding: zero
+      return_history_validity: True
+    env_runner:
+      protocol: corrected
+      n_test: 100
+      n_test_vis: 0
+      n_parallel_envs: 10
 
 logging:
   project: oat_dev
   resume: False
-  mode: online
+  mode: offline
   name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_N${training.num_demo}
-  tags: ["${name}", "${task_name}"]
+  tags: ['${name}', '${task_name}']
   id: null
   group: null
 
@@ -134,7 +127,7 @@ checkpoint:
     monitor_key: mean_success_rate
     mode: max
     k: 3
-    format_str: "ep-{epoch:04d}_sr-{mean_success_rate:.3f}.ckpt"
+    format_str: ep-{epoch:04d}_sr-{mean_success_rate:.3f}.ckpt
   save_last_ckpt: True
   save_last_snapshot: False
 

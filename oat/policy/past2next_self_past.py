@@ -40,10 +40,8 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
     * It runs under `torch.inference_mode()` and is detached before entering
       the condition — no gradient flows through generation, which is discrete
       and non-differentiable anyway.
-    * `self.action_tokenizer`'s train/eval mode is restored to whatever it was,
-      deliberately preserving the baseline's behaviour (the workspace's
-      `model.train()` flips the frozen tokenizer back into train mode) so this
-      variant stays comparable to `train_past2next`.
+    * The Stage 1 tokenizer stays in eval mode throughout policy training,
+      including after inner generation, so its dropout cannot change token targets.
     * Legacy datasets retain edge repetition. With history_padding="zero",
       unavailable commands are zero and prev_window_valid prevents generation
       before a complete previous execution window exists.

@@ -162,6 +162,12 @@ class Past2NextPolicy(BasePolicy):
             f"={max_cond_len}\n"
         )
 
+    def train(self, mode: bool = True):
+        """Train the policy while keeping the Stage 1 tokenizer in evaluation mode."""
+        super().train(mode)
+        self.action_tokenizer.eval()
+        return self
+
     # ── BasePolicy interface ────────────────────────────────────────────────
 
     def get_observation_encoder(self):

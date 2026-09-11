@@ -1,6 +1,6 @@
 """
 Usage:
-python scripts/run_workspace.py --config-name=train_tokenizer
+python scripts/run_workspace.py --config-name=train_oattok_so3aug
 """
 
 if __name__ == "__main__":
