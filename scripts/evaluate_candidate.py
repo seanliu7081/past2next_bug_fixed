@@ -120,8 +120,8 @@ def parser():
     p.add_argument("--topk", type=int)
     p.add_argument("--use-k-tokens", type=int)
     p.add_argument("--n-action-steps", type=int)
-    p.add_argument("--crop-mode", choices=("checkpoint", "center"), default="checkpoint",
-                   help="Use checkpoint crop behavior or fixed center crops at its native crop size")
+    p.add_argument("--crop-mode", choices=("checkpoint", "center"), default="center",
+                   help="Center crops by default; checkpoint uses its saved crop flag with current encoder defaults")
     p.add_argument("--weights", choices=("ema", "model"), default="ema")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--threads", type=int, default=4)

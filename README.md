@@ -51,6 +51,14 @@ python scripts/compose_libero_multitask_dataset.py -mt libero10
 the 450/50 split; 043 explicitly sets it to zero and disables offline validation.
 Simulator evaluation episodes are separate from these training demonstrations.
 
+The image encoders use random crops for regular training observations and fixed
+center crops for validation and inference (`eval_fixed_crop: true`). For the three
+scratch variants, each 128×128 image becomes a 112×112 crop; the evaluation crop
+removes eight pixels from each side. Generated-history rollouts temporarily use
+center crops to match inference, then restore the training crop mode. Both evaluation
+scripts select center crops by default. Direct inference callers should use
+`policy.eval()` before `predict_action()`.
+
 ## Stage 1: train the tokenizer
 
 Train the action-only tokenizer from random weights:
@@ -129,7 +137,6 @@ MUJOCO_GL=egl accelerate launch --multi_gpu --num_processes 2 \
     task.policy.lazy_eval=false training.rollout_every=25 \
     task.policy.env_runner.protocol=official task.policy.env_runner.n_test=500 \
     +task.policy.env_runner.test_start_seed=3000 \
-    ++policy.obs_encoder.vision_encoder.eval_fixed_crop=true \
     dataloader.batch_size=32 \
     hydra.run.dir=output/training/046_scratch_2gpu
 ```

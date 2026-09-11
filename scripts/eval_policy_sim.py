@@ -74,7 +74,10 @@ def eval_policy_sim(
             output_dir = base_output_dir
         
         # load checkpoint
-        policy, cfg = BasePolicy.from_checkpoint(ckpt, return_configuration=True)
+        policy, cfg = BasePolicy.from_checkpoint(
+            ckpt, return_configuration=True,
+            policy_overrides={"obs_encoder": {"vision_encoder": {"eval_fixed_crop": True}}},
+        )
         
         device = torch.device(device)
         policy.to(device)

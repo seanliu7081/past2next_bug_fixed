@@ -34,6 +34,7 @@ policy:
     vision_encoder:
       _target_: oat.perception.robomimic_vision_encoder.RobomimicRgbEncoder
       crop_shape: [76, 76]
+      eval_fixed_crop: True  # Random training crops; center crops in eval/inference.
 # ---------------------------------------------------------------------
 
     state_encoder:

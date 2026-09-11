@@ -14,13 +14,14 @@ from oat.model.common.normalizer import LinearNormalizer, _normalize
 
 class RobomimicRgbEncoder(BaseObservationEncoder):
     """
-    Assumes rgb input: B,H,W,C
+    Assumes rgb input: B,H,W,C.
+    Crops are random in training and fixed at the center in evaluation by default.
     """
     def __init__(self,
         shape_meta: dict,
         crop_shape: Union[Tuple[int,int], Dict[str,tuple], None]=None,
         use_group_norm: bool=True,
-        eval_fixed_crop: bool = False,
+        eval_fixed_crop: bool = True,
         share_rgb_model: bool=False,
     ):
         super().__init__()
