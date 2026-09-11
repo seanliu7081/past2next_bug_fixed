@@ -25,6 +25,7 @@ policy:
     _target_: oat.perception.task_residual_fused_obs_encoder.TaskResidualFusedObservationEncoder
     _recursive_: False
     shape_meta: ${shape_meta}
+    task_uids: ${task.policy.task_uids}
     vision_encoder:
       _target_: oat.perception.robomimic_vision_encoder.RobomimicRgbEncoder
       crop_shape: [112, 112]

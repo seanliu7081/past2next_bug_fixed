@@ -34,12 +34,12 @@ SHAPE_META = {
 
 
 class FakeVision(nn.Module):
-    def __init__(self):
+    def __init__(self, feature_dim=128):
         super().__init__()
-        self.bias = nn.Parameter(torch.linspace(-1, 1, 128))
+        self.bias = nn.Parameter(torch.linspace(-1, 1, feature_dim))
 
     def output_feature_dim(self):
-        return 128
+        return self.bias.numel()
 
     def forward(self, obs):
         return obs['image_features'] + self.bias
@@ -82,8 +82,9 @@ def observation(uids=(30, 39)):
 
 
 class FakeTokenizer(nn.Module):
-    def __init__(self):
+    def __init__(self, action_dim=7):
         super().__init__()
+        self.action_dim = action_dim
         self.anchor = nn.Parameter(torch.zeros(()))
         self.quantizer = SimpleNamespace(codebook_size=11)
         self.latent_horizon = 8
@@ -93,7 +94,7 @@ class FakeTokenizer(nn.Module):
 
     def detokenize(self, tokens):
         values = tokens.float().repeat_interleave(2, dim=1)
-        return values[..., None].expand(-1, -1, 7).clone() / 10
+        return values[..., None].expand(-1, -1, self.action_dim).clone() / 10
 
 
 def policy(cls=TaskResidualFusedObservationEncoder):
@@ -280,3 +281,58 @@ def test_retained_branches_share_policy_shape_and_scratch_initialization():
     assert tasklr.task.policy.dataset.val_ratio == .1
     assert all500.policy.obs_encoder._target_.endswith('.FusedObservationEncoder')
     assert tasklr.policy.obs_encoder._target_.endswith('.TaskResidualFusedObservationEncoder')
+
+
+def sink3_components():
+    """Actual Sink3 ports and dimensions with a cheap three-camera backbone."""
+    meta = {'obs': {}, 'action': {'shape': [12]}}
+    for camera in ('robot0_agentview_left_image', 'robot0_agentview_right_image',
+                   'robot0_eye_in_hand_image'):
+        meta['obs'][camera] = {'shape': [128, 128, 3], 'type': 'rgb'}
+    for port, dim in (('robot0_eef_pos', 3), ('robot0_eef_quat', 4),
+                      ('robot0_gripper_qpos', 2), ('robot0_base_pos', 3),
+                      ('robot0_base_quat', 4), ('task_uid', 1)):
+        meta['obs'][port] = {'shape': [dim], 'type': 'state'}
+    data = {'action': torch.linspace(-1, 1, 24).reshape(2, 12)}
+    obs = {'image_features': torch.zeros(3, 2, 192)}
+    for port, attr in meta['obs'].items():
+        if attr['type'] == 'state':
+            dim = attr['shape'][0]
+            data[port] = torch.linspace(-1, 1, 2 * dim).reshape(2, dim)
+            obs[port] = torch.zeros(3, 2, dim)
+    data['task_uid'] = torch.tensor([[2], [4], [5]])
+    obs['task_uid'] = torch.tensor([5, 2, 4])[:, None, None].expand(-1, 2, 1).clone()
+    norm = LinearNormalizer()
+    norm.fit(data)
+    with patch('oat.perception.fused_obs_encoder.hydra.utils.instantiate',
+               side_effect=lambda specification, **kwargs: specification):
+        candidate = TaskResidualFusedObservationEncoder(
+            meta, vision_encoder=FakeVision(192),
+            state_encoder=ProjectionStateEncoder(meta), task_uids=[2, 4, 5])
+    candidate.set_normalizer(norm)
+    return meta, candidate, norm, obs
+
+
+def test_noncontiguous_task_ids_with_sink3_features_and_checkpoint_roundtrip():
+    _, candidate, _, obs = sink3_components()
+    assert candidate.output_feature_dim() == 209
+    assert candidate.task_residual.weight.shape == (3, 209)
+    assert candidate.task_uids == (2, 4, 5)
+    baseline = candidate(obs).detach()
+    with torch.no_grad():
+        candidate.task_residual.weight.copy_(torch.tensor([.1, .2, .3])[:, None].expand(-1, 209))
+    torch.testing.assert_close(candidate(obs), baseline + torch.tensor([.3, .1, .2])[:, None, None])
+    assert '_task_uids' not in candidate.state_dict()
+    _, restored, _, _ = sink3_components()
+    restored.load_state_dict(candidate.state_dict(), strict=True)
+    assert torch.equal(restored(obs), candidate(obs))
+    # UID 3 is numerically between valid IDs but does not belong to Sink3.
+    obs['task_uid'].fill_(3)
+    with pytest.raises(ValueError, match='task_uid'):
+        candidate(obs)
+
+
+@pytest.mark.parametrize('task_uids', [[], [2, 2, 5], [2, 4.5, 5], [True, 4, 5]])
+def test_task_id_configuration_rejects_empty_duplicate_or_noninteger_ids(task_uids):
+    with pytest.raises(ValueError, match='task_uids'):
+        TaskResidualFusedObservationEncoder(SHAPE_META, task_uids=task_uids)

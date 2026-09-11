@@ -13,7 +13,7 @@ from oat.perception.fused_obs_encoder import FusedObservationEncoder
 from oat.perception.task_residual_fused_obs_encoder import TaskResidualFusedObservationEncoder
 from oat.policy.past2next_self_past import Past2NextSelfPastPolicy
 from oat.policy.past2next_task_lr import Past2NextSelfPastTaskLRPolicy
-from test_task_residual import SHAPE_META, FakeTokenizer, encoder, normalizer, observation
+from test_task_residual import SHAPE_META, FakeTokenizer, encoder, normalizer, observation, sink3_components
 
 KWARGS = dict(policy_lr=1e-5, obs_enc_lr=2e-6, weight_decay=1e-4, betas=(.9, .95))
 
@@ -163,3 +163,27 @@ def test_config_preserves_task_residual_variant_with_scratch_defaults():
     assert cfg.training.max_val_steps is None and not cfg.val_dataloader.drop_last
     assert cfg.training.checkpoint_every == cfg.training.snapshot_every == 25
     assert cfg.policy.past_n == 7
+
+
+def test_sink3_table_gets_independent_lr_and_gradients_from_12d_actions():
+    meta, obs_encoder, norm, obs = sink3_components()
+    candidate = Past2NextSelfPastTaskLRPolicy(
+        meta, obs_encoder, FakeTokenizer(action_dim=12), n_action_steps=8,
+        n_obs_steps=2, past_n=7, embed_dim=16, n_layers=2, n_heads=2, dropout=0,
+        temperature=0, self_past_schedule='optimizer_step')
+    candidate.set_normalizer(norm)
+    optimizer = candidate.get_optimizer(**KWARGS, task_residual_lr=1e-3)
+    table = candidate.obs_encoder.task_residual.weight
+    assert table.shape == (3, 209)
+    assert parameter_ids(optimizer).count(id(table)) == 1
+    assert optimizer.param_groups[-1]['params'] == [table]
+    assert optimizer.param_groups[-1]['lr'] == 1e-3
+    batch = {'obs': obs, 'action': torch.zeros(3, 16, 12),
+             'past_action': torch.zeros(3, 7, 12)}
+    loss = candidate(batch, history_mode='expert')
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert table.grad is not None and torch.isfinite(table.grad).all()
+    assert (table.grad.abs().sum(dim=-1) > 0).all()
+    optimizer.step()
+    assert (table.abs().sum(dim=-1) > 0).all()

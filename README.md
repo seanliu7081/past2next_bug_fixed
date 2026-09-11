@@ -167,3 +167,53 @@ For the corrected development protocol, change the protocol to `corrected`, poli
 seed to 45 and episode start seed to 4000. See the comparison document for all five
 recorded schedules and the limitations of historical legacy resets. These schedules
 are already known and reused results should be reported as retrospective checks.
+
+
+## RoboCasa Sink3
+
+The Sink3 task configs are `task/tokenizer=robocasa/sink3` and
+`task/policy=robocasa/sink3_with_prev_window`. Both point to
+`/workspace/past_action_robocasa/oat/data/robocasa/sink3_N600.zarr` and use seed 42
+with a 540-demonstration training split and 60-demonstration validation split.
+The policy receives three 128×128 RGB cameras, 17 state values (including the
+task ID), and 12-dimensional actions. Raw task IDs are 2 (TurnOffSinkFaucet),
+4 (TurnOnSinkFaucet), and 5 (TurnSinkSpout). Its task residual has shape 3×209.
+
+The two-stage launcher uses the existing standalone training recipes:
+
+```bash
+/venv/oat/bin/python scripts/train_robocasa_sink3.py \
+    --gpus 0,1 --output-dir output/training/robocasa_sink3_new_run
+```
+
+Run this command through a managed job service for a long training run. It refuses
+an existing output directory. Add `--smoke` with a new directory for two training
+batches and one validation/reconstruction batch per stage.
+
+Stage 1 trains `train_oattok_so3aug` for 5,001 epochs with global batch size 256.
+It follows the original RoboCasa augmentation recipe: `left_noise` on the arm
+orientation slice, with `augment_position=false`. The checkpoint with the lowest
+held-out reconstruction MSE is copied to `frozen_tokenizer.ckpt`; Stage 2 loads
+its EMA weights and keeps it frozen, including dropout and normalization.
+
+Stage 2 uses `train_past2next_scratch_tasklr` for 251 epochs with global batch
+size 64. Policy and vision weights start fresh. Policy, vision, and task-residual
+learning rates are 1e-5, 2e-6, and 1e-3. The original generated-history curriculum,
+random 112×112 training crops, and fixed center evaluation crops are retained.
+Offline validation runs during training; simulator rollouts are disabled by
+default. Best policy checkpoints are ranked by validation loss, with regular
+25-epoch snapshots also retained. Logs and status are in `tokenizer.log`,
+`policy.log`, and `status.json` inside the output directory.
+
+For simulator evaluation, the RoboCasa and matching robosuite sources on this
+instance can be made available without changing the training environment:
+
+```bash
+export PYTHONPATH="$PWD:/workspace/past_action_robocasa/robosuite:/workspace/past_action_robocasa/robocasa"
+export MUJOCO_GL=egl
+```
+
+The Sink3 runner uses explicit reset seeds and stable task IDs. When enabling
+in-training rollouts, use `task.policy.lazy_eval=false` and set
+`task.policy.env_runner.n_test=150 task.policy.env_runner.n_parallel_envs=15`
+for 50 episodes per task.

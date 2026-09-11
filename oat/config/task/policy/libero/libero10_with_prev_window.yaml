@@ -2,6 +2,7 @@ name: libero10
 
 task_name: libero10
 lazy_eval: true
+task_uids: [30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
 
 shape_meta: &shape_meta
   obs:

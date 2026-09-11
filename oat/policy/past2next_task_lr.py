@@ -10,7 +10,7 @@ class Past2NextSelfPastTaskLRPolicy(Past2NextSelfPastPolicy):
     """Preserve policy state/inference and optionally split one optimizer tensor.
 
     With task_residual_lr=None the parent optimizer is returned verbatim. With
-    an explicit LR, the existing trainable 10x138 table moves from its encoder
+    an explicit LR, the existing trainable task table moves from its encoder
     group to a fifth group. Its weight decay and every other parameter setting
     stay unchanged. A new five-group optimizer requires fresh initialization or
     continuation from a checkpoint made with this same optimizer recipe.
@@ -28,8 +28,9 @@ class Past2NextSelfPastTaskLRPolicy(Past2NextSelfPastPolicy):
         if not isinstance(self.obs_encoder, TaskResidualFusedObservationEncoder):
             raise ValueError('task_residual_lr requires TaskResidualFusedObservationEncoder')
         table = self.obs_encoder.task_residual.weight
-        if tuple(table.shape) != (10, 138) or not table.requires_grad:
-            raise ValueError('The categorical task residual must be a trainable 10x138 table')
+        expected_shape = (self.obs_encoder.num_tasks, self.obs_encoder.output_feature_dim())
+        if tuple(table.shape) != expected_shape or not table.requires_grad:
+            raise ValueError(f'The categorical task residual must be a trainable {expected_shape} table')
         optimizer = super().get_optimizer(**kwargs)
         parameters = [parameter for group in optimizer.param_groups for parameter in group['params']]
         if len(parameters) != len({id(parameter) for parameter in parameters}):

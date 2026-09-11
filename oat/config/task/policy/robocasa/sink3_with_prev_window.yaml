@@ -1,0 +1,87 @@
+# Stage 2: fresh Sink3 policy with a frozen tokenizer and generated history.
+name: sink3
+
+task_name: sink3
+lazy_eval: true
+# Stable RoboCasa dataset IDs: TurnOffSinkFaucet, TurnOnSinkFaucet, TurnSinkSpout.
+task_uids: [2, 4, 5]
+
+shape_meta:
+  obs:
+    robot0_agentview_left_image:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_agentview_right_image:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eye_in_hand_image:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+      type: state
+    robot0_eef_quat:
+      shape: [4]
+      type: state
+    robot0_gripper_qpos:
+      shape: [2]
+      type: state
+    robot0_base_pos:
+      shape: [3]
+      type: state
+    robot0_base_quat:
+      shape: [4]
+      type: state
+    task_uid:
+      shape: [1]
+      type: state
+  action:
+    shape: [12]
+
+env_runner:
+  _target_: oat.env_runner.robocasa_multitask_runner.RoboCasaMultiTaskRunner
+  task_name: sink3
+  robots: PandaOmron
+  n_test: 150
+  n_test_vis: 9
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 20
+  # A multiple of three gives every sink task the same number of slots.
+  n_parallel_envs: 15
+  image_size: 128
+  camera_names:
+    - robot0_agentview_left
+    - robot0_agentview_right
+    - robot0_eye_in_hand
+  state_ports:
+    - robot0_eef_pos
+    - robot0_eef_quat
+    - robot0_gripper_qpos
+    - robot0_base_pos
+    - robot0_base_quat
+  max_episode_steps: 500
+
+dataset:
+  _target_: oat.dataset.zarr_dataset_with_prev_window.ZarrDatasetWithPrevWindow
+  zarr_path: /workspace/past_action_robocasa/oat/data/robocasa/sink3_N600.zarr
+  obs_keys:
+    - robot0_agentview_left_image
+    - robot0_agentview_right_image
+    - robot0_eye_in_hand_image
+    - robot0_eef_pos
+    - robot0_eef_quat
+    - robot0_gripper_qpos
+    - robot0_base_pos
+    - robot0_base_quat
+    - task_uid
+  action_key: action
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${horizon}
+  seed: ${seed}
+  val_ratio: 0.1
+  past_n: ${past_n}
+  # Execution stride (8), independent of the predicted horizon (16).
+  n_exec_steps: ${n_action_steps}
+  history_padding: zero
+  return_history_validity: true

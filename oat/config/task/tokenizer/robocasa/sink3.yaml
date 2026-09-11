@@ -1,0 +1,18 @@
+# Stage 1: train the 12-dimensional Sink3 action tokenizer.
+name: sink3
+
+task_name: sink3
+
+shape_meta:
+  action:
+    shape: [12]
+
+dataset:
+  _target_: oat.dataset.zarr_dataset.ZarrDataset
+  zarr_path: /workspace/past_action_robocasa/oat/data/robocasa/sink3_N600.zarr
+  obs_keys: []
+  action_key: action
+  n_obs_steps: 0
+  n_action_steps: ${horizon}
+  seed: ${seed}
+  val_ratio: 0.1
