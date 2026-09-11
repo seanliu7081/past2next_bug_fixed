@@ -1,0 +1,46 @@
+defaults:
+  - train_past2next_self_past
+  - _self_
+
+name: train_past2next_improve
+
+# Keep the successful tokenizer, seven actions, and explicit dynamics.
+policy:
+  n_layers: 8
+  n_heads: 8
+  action_tokenizer:
+    checkpoint: /workspace/past2next_clean/output/20260818/073434_train_oattok_so3aug_libero10_N500/checkpoints/ep-4960_mse-0.001.ckpt
+  self_past_schedule: optimizer_step
+  self_past_ramp_steps: 10000
+  self_past_p: 0.5
+  self_past_warmup_steps: 1000
+
+training:
+  resume: false
+  init_checkpoint: null
+  init_weights: ema
+  init_allow_spatial_resize: false
+  num_epochs: 251
+  snapshot_every: 25
+  validate_generated_history: true
+  lr_scheduler: cosine
+  rollout_every: 25
+  max_reconst_steps: 20
+
+optimizer:
+  weight_decay: 1.0e-4
+
+task:
+  policy:
+    lazy_eval: true
+    dataset:
+      history_padding: zero
+      return_history_validity: true
+    env_runner:
+      protocol: corrected
+      n_test: 100
+      n_test_vis: 0
+      n_parallel_envs: 10
+
+logging:
+  mode: offline

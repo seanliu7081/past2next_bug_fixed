@@ -5,27 +5,13 @@ defaults:
 name: train_past2next_self_past
 _target_: oat.workspace.train_policy.TrainPolicyWorkspace
 
-# Identical to train_past2next.yaml except for WHERE past_action comes from
-# during training:
-#   train_past2next -> ground-truth actions from the dataset
-#   this one        -> the policy's own generated actions, produced by
-#                      re-running itself on the previous rollout window
-#                      (prev_obs)
-# No zero-padding change: boundary windows keep the SequenceSampler's edge
-# repetition, exactly as in the baseline.
-# Differences vs train_past2next.yaml, in full:
-#   - defaults task/policy  -> libero/libero10_with_prev_window
-#   - name
-#   - policy._target_       -> Past2NextSelfPastPolicy
-#   - policy.self_past_*    -> new knobs (added, nothing removed)
+# Shared self-past policy configuration inherited by the 015/043/046 recipes.
+# Training can substitute generated history from the previous observation window.
+# The improve config supplies zero history padding and the optimizer-step schedule.
 
 seed: 42
-# horizon: 32
 horizon: 16
-# horizon: 64
-# n_action_steps: 16
 n_action_steps: 8
-# n_action_steps: 32
 n_obs_steps: 2
 past_n: 7
 task_name: ${task.policy.name}

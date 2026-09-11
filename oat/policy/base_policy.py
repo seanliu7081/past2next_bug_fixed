@@ -2,6 +2,8 @@ from typing import Dict, List, Union, Optional, Tuple
 import torch
 import dill
 import hydra
+from omegaconf import OmegaConf
+from oat.common.hydra_util import register_new_resolvers
 from oat.model.common.module_attr_mixin import ModuleAttrMixin
 from oat.model.common.normalizer import LinearNormalizer
 
@@ -14,16 +16,28 @@ class BasePolicy(ModuleAttrMixin):
         checkpoint: str,
         output_dir: Optional[str] = None,
         return_configuration: bool = False,
+        weights: Optional[str] = None,
+        policy_overrides: Optional[Dict] = None,
     ):
-        payload = torch.load(open(checkpoint, 'rb'), pickle_module=dill)
-        cfg = payload['cfg']
-        cls = hydra.utils.get_class(cfg._target_)
-        workspace = cls(cfg, output_dir=output_dir, lazy_instantiation=False)
-        workspace.load_payload(payload, exclude_keys=None, include_keys=None)
-        policy = workspace.model
-        if getattr(cfg.training, 'use_ema', False):
-            policy = workspace.ema_model
-        
+        # Trusted local checkpoints load on CPU without workspace/optimizer allocation.
+        with open(checkpoint, 'rb') as stream:
+            payload = torch.load(stream, pickle_module=dill, map_location='cpu')
+        # Rebuild a mutable copy: Hydra checkpoint configs can be struct-locked.
+        cfg = OmegaConf.create(OmegaConf.to_container(payload['cfg'], resolve=False))
+        if policy_overrides:
+            cfg = OmegaConf.merge(cfg, {'policy': policy_overrides})
+        register_new_resolvers()
+        if weights is None:
+            weights = 'ema' if getattr(cfg.training, 'use_ema', False) else 'model'
+        if weights not in ('ema', 'model'):
+            raise ValueError("weights must be 'ema' or 'model'")
+        state_key = 'ema_model' if weights == 'ema' else 'model'
+        if state_key not in payload['state_dicts']:
+            raise ValueError(f'Checkpoint does not contain {state_key} weights')
+        policy = hydra.utils.instantiate(cfg.policy)
+        policy.load_state_dict(payload['state_dicts'][state_key])
+        policy.eval()
+
         if return_configuration:
             return policy, cfg
         else:

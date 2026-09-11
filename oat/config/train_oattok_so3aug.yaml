@@ -21,8 +21,10 @@ tokenizer:
     # max_angle_deg: 10.0
     max_angle_deg: 30.0
     # max_angle_deg: 60.0
-    mode: left_noise
-    augment_position: false
+    # mode: left_noise
+    mode: conjugate
+    # augment_position: false
+    augment_position: true
     pos_start: 0
     pos_end: 3
     rot_start: 3

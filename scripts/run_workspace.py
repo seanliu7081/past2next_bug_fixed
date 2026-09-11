@@ -9,7 +9,7 @@ if __name__ == "__main__":
     import pathlib
 
     ROOT_DIR = str(pathlib.Path(__file__).parent.parent)
-    sys.path.append(ROOT_DIR)
+    sys.path.insert(0, ROOT_DIR)
     os.chdir(ROOT_DIR)
 
 import sys

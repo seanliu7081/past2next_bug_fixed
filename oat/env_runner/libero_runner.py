@@ -5,6 +5,10 @@ import tqdm
 import math
 import pathlib
 import dill
+import json
+import os
+import tempfile
+import time
 import wandb.sdk.data_types.video as wandb_video
 
 from oat.gymnasium_util.multistep_wrapper import MultiStepWrapper
@@ -17,6 +21,59 @@ from oat.policy.base_policy import BasePolicy
 from oat.common.pytorch_util import dict_apply
 
 from typing import Optional, List
+
+def atomic_write_records(path, records):
+    """Replace a complete JSONL snapshot after each finished rollout batch."""
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            for record in records:
+                stream.write(json.dumps(record, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def build_episode_schedule(task_names, n_test, n_parallel_envs,
+                           test_start_seed=1000, protocol="legacy",
+                           init_state_offset=0):
+    """Explicit schedules independent of worker count in corrected protocols."""
+    if protocol not in {"legacy", "corrected", "official"}:
+        raise ValueError(f"Unknown protocol {protocol}")
+    if n_test < 1 or n_parallel_envs < 1 or not task_names:
+        raise ValueError("Positive trials/workers and at least one task are required")
+    if len(set(task_names)) != len(task_names):
+        raise ValueError("Task filters must not contain duplicates")
+    if init_state_offset < 0:
+        raise ValueError("init_state_offset must be nonnegative")
+    if protocol == "legacy":
+        names = []
+        for start in range(0, len(task_names), n_parallel_envs):
+            batch = task_names[start:start + n_parallel_envs]
+            for _ in range(math.ceil(n_test / len(task_names))):
+                names.extend(batch)
+        names = names[:n_test]
+    else:
+        names = [task_names[i % len(task_names)] for i in range(n_test)]
+    task_counts = dict.fromkeys(task_names, 0)
+    schedule = []
+    for i, name in enumerate(names):
+        task_trial = task_counts[name]
+        schedule.append({
+            "episode_index": i, "task_name": name, "task_trial": task_trial,
+            "episode_seed": int(test_start_seed + i),
+            "episode_seed_applied": protocol != "legacy",
+            "init_state_id": int(init_state_offset + task_trial) if protocol == "official" else None,
+            "protocol": protocol,
+        })
+        task_counts[name] += 1
+    return schedule
+
 
 def maybe_to_torch(x, device, dtype):
     if isinstance(x, np.ndarray):
@@ -53,6 +110,10 @@ class LiberoRunner(BaseRunner):
             'robot0_gripper_qpos',
         ],
         max_episode_steps: int = 550,
+        protocol: str = "legacy",
+        task_names: Optional[List[str]] = None,
+        init_state_offset: int = 0,
+        episode_records_path: Optional[str] = None,
     ):
         super().__init__(output_dir)
 
@@ -63,16 +124,17 @@ class LiberoRunner(BaseRunner):
         assert n_parallel_envs > 0, "n_parallel_envs must be positive"
         assert n_test_vis <= n_test, "n_test_vis must be less than or equal to n_test"
 
-        # get subtasks and distribute across envs in batches
-        subtask_names = get_subtasks(task_name)
-        num_tasks = len(subtask_names)
-        num_repeats = math.ceil(n_test / num_tasks)
-        env_task_names = []
-        for batch_start in range(0, num_tasks, n_parallel_envs):
-            batch_tasks = subtask_names[batch_start:batch_start + n_parallel_envs]
-            for _ in range(num_repeats):
-                env_task_names.extend(batch_tasks)
-        env_task_names = env_task_names[:n_test]
+        # Preserve legacy ordering; corrected schedules do not depend on workers.
+        all_subtask_names = get_subtasks(task_name)
+        subtask_names = all_subtask_names if task_names is None else list(task_names)
+        unknown = set(subtask_names) - set(all_subtask_names)
+        if unknown:
+            raise ValueError(f"Unknown tasks for {task_name}: {sorted(unknown)}")
+        schedule = build_episode_schedule(
+            subtask_names, n_test, n_parallel_envs, test_start_seed,
+            protocol, init_state_offset,
+        )
+        env_task_names = [episode["task_name"] for episode in schedule]
 
         # setup env
         env_seeds = []
@@ -80,7 +142,8 @@ class LiberoRunner(BaseRunner):
         env_init_fn_dills = []
         for i in range(n_test):
             this_task_name = env_task_names[i]
-            this_seed = test_start_seed + i
+            this_seed = schedule[i]["episode_seed"]
+            this_init_state_id = schedule[i]["init_state_id"]
             env_seeds.append(this_seed)
             enable_render = i < n_test_vis
 
@@ -95,6 +158,7 @@ class LiberoRunner(BaseRunner):
                                 camera_names=camera_names,
                                 state_ports=state_ports,
                                 max_episode_steps=max_episode_steps,
+                                protocol=protocol,
                             ),
                             video_recoder=VideoRecorder.create_h264(
                                 fps=fps,
@@ -114,7 +178,8 @@ class LiberoRunner(BaseRunner):
                     )
                 env_fns.append(env_fn)
         
-            def init_fn(env, task_name=this_task_name, seed=this_seed, enable_render=enable_render):
+            def init_fn(env, task_name=this_task_name, seed=this_seed,
+                        enable_render=enable_render, init_state_id=this_init_state_id):
                 if env.env.env.task_name != task_name:
                     env.env.env.close()
                     env.env.env = LiberoEnv(
@@ -124,6 +189,7 @@ class LiberoRunner(BaseRunner):
                         camera_names=camera_names,
                         state_ports=state_ports,
                         max_episode_steps=max_episode_steps,
+                        protocol=protocol,
                     )
                 env.env.video_recoder.stop()
                 env.env.file_path = None
@@ -134,7 +200,10 @@ class LiberoRunner(BaseRunner):
                     filename.parent.mkdir(parents=True, exist_ok=True)
                     filename = str(filename)
                     env.env.file_path = filename
-                env.reset()
+                if protocol == "legacy":
+                    env.reset()
+                else:
+                    env.env.env.configure_episode(seed, init_state_id)
             env_init_fn_dills.append(dill.dumps(init_fn))
 
         assert len(env_fns) == n_parallel_envs
@@ -155,6 +224,7 @@ class LiberoRunner(BaseRunner):
                         state_ports=state_ports,
                         max_episode_steps=max_episode_steps,
                         enable_render=False,
+                        protocol=protocol,
                     ),
                     video_recoder=VideoRecorder.create_h264(
                         fps=fps,
@@ -174,7 +244,11 @@ class LiberoRunner(BaseRunner):
             )
 
         env = AsyncVectorEnv(env_fns, shared_memory=False,
-            dummy_env_fn=dummy_env_fn
+            dummy_env_fn=dummy_env_fn,
+            # MultiStepWrapper already retains a completed episode. Automatic
+            # resets otherwise discard its history and can skip the first action
+            # after an explicit reset when shared_memory=False.
+            autoreset=protocol == "legacy",
             # context='spawn',
         )  # NOTE: turn off shared_memory to use Text space
 
@@ -189,6 +263,10 @@ class LiberoRunner(BaseRunner):
         self.n_action_steps = n_action_steps
         self.max_episode_steps = max_episode_steps
         self.tqdm_interval_sec = tqdm_interval_sec
+        self.protocol = protocol
+        self.episode_schedule = schedule
+        self.episode_records_path = episode_records_path
+        self.last_episode_records = []
 
     @torch.inference_mode()
     def run(self, 
@@ -204,6 +282,9 @@ class LiberoRunner(BaseRunner):
         n_envs = len(self.env_fns)
         n_inits = len(self.env_init_fn_dills)
         n_chunks = math.ceil(n_inits / n_envs)
+
+        self.last_episode_records = []
+        run_started = time.monotonic()
 
         # allocate data
         all_video_paths = [None] * n_inits
@@ -222,6 +303,7 @@ class LiberoRunner(BaseRunner):
                 this_init_fns.extend([self.env_init_fn_dills[0]] * n_diff)
             assert len(this_init_fns) == n_envs
 
+            chunk_started = time.monotonic()
             # init envs
             self.env.call_each(
                 'run_dill_function', 
@@ -276,9 +358,29 @@ class LiberoRunner(BaseRunner):
 
             # collect data for this round
             all_video_paths[this_global_slice] = self.env.render()[this_local_slice]
+            episode_rewards = self.env.call("get_rewards")
+            chunk_seconds = time.monotonic() - chunk_started
+            for local_i, global_i in enumerate(range(start, end)):
+                record = dict(self.episode_schedule[global_i])
+                steps = len(episode_rewards[local_i])
+                record.update({
+                    "success": bool(all_success[global_i]),
+                    "policy_steps": steps,
+                    "max_episode_steps": self.max_episode_steps,
+                    "n_action_steps": self.n_action_steps,
+                    "video_path": all_video_paths[global_i],
+                    "rollout_batch_seconds": chunk_seconds,
+                    "elapsed_seconds": time.monotonic() - run_started,
+                    "termination": "success" if all_success[global_i] else
+                                   "timeout" if steps >= self.max_episode_steps else "terminated",
+                })
+                self.last_episode_records.append(record)
+            if self.episode_records_path is not None:
+                atomic_write_records(self.episode_records_path, self.last_episode_records)
 
         # clear out video buffer
-        _ = self.env.reset()
+        if self.protocol == "legacy":
+            _ = self.env.reset()
 
         # log
         log_data = dict()

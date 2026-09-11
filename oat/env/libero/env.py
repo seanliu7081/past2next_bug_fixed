@@ -1,5 +1,6 @@
 import os
 import string
+import random
 import numpy as np
 import gymnasium
 from libero.libero import benchmark, get_libero_path
@@ -39,11 +40,30 @@ class LiberoEnv(gymnasium.Env):
         video_resolution: int = 512,
         max_episode_steps: int = 550,
         enable_render: bool = True,
+        protocol: str = "legacy",
     ):
         super().__init__()
+        if protocol not in {"legacy", "corrected", "official"}:
+            raise ValueError(f"Unknown evaluation protocol: {protocol}")
+        self.protocol = protocol
+        self.episode_seed = seed
+        self.init_state_id = None
+        self.init_states = None
+        self.init_states_path = None
 
         libero_suite, task_suite_id, task_uid = task_name_to_suite_and_ids[task_name]
         task = benchmark.get_benchmark_dict()[libero_suite]().get_task(task_suite_id)
+        if protocol == "official":
+            # Same state file as LIBERO's evaluate_one_task_success. Explicit
+            # CPU loading supports current torch defaults and trusted old files.
+            import torch
+            self.init_states_path = os.path.join(
+                get_libero_path("init_states"), task.problem_folder,
+                task.init_states_file,
+            )
+            self.init_states = torch.load(
+                self.init_states_path, map_location="cpu", weights_only=False,
+            )
         env = ControlEnv(
             bddl_file_name=os.path.join(
                 get_libero_path("bddl_files"),
@@ -103,8 +123,24 @@ class LiberoEnv(gymnasium.Env):
     def _let_objects_fall(self):
         # libero env needs a few steps to let objects fall to the table/ground
         dummy_action = [0.] * 6 + [-1.]
+        raw_obs = None
         for _ in range(10):
-            self.env.step(dummy_action)
+            raw_obs, _, _, _ = self.env.step(dummy_action)
+        return raw_obs
+
+    def configure_episode(self, seed: int, init_state_id: Optional[int] = None):
+        """Select the next reset; the runner performs that reset exactly once."""
+        if self.protocol == "legacy":
+            raise ValueError("Legacy protocol intentionally retains its original reset behavior")
+        if self.protocol == "official":
+            if init_state_id is None or not 0 <= init_state_id < len(self.init_states):
+                raise ValueError(
+                    f"Initial-state index {init_state_id} outside [0, {len(self.init_states)})"
+                )
+        elif init_state_id is not None:
+            raise ValueError("Initial states require the official protocol")
+        self.episode_seed = int(seed)
+        self.init_state_id = init_state_id
 
     def _extract_obs(self, 
         raw_obs: Optional[Dict[str, np.ndarray]]=None
@@ -141,12 +177,39 @@ class LiberoEnv(gymnasium.Env):
         return self._extract_obs(obs), reward, self.done, False, info
     
     def reset(self, seed=None, options=None):
-        obs = self.env.reset()
-        obs_dict = self._extract_obs(obs)
+        if self.protocol == "legacy":
+            # Preserve the historical stale observation and RNG behavior for
+            # explicitly named reproductions of old reported results.
+            obs = self.env.reset()
+            obs_dict = self._extract_obs(obs)
+            self.done = False
+            self.cur_step = 0
+            self._let_objects_fall()
+            return obs_dict, {'prompt': self.task_prompt}
+
+        episode_seed = self.episode_seed if seed is None else int(seed)
+        random.seed(episode_seed)
+        np.random.seed(episode_seed)
+        self.env.seed(episode_seed)
+        raw_obs = self.env.reset()
+        if self.protocol == "official":
+            if self.init_state_id is None:
+                raise ValueError("configure_episode must set an official initial-state index")
+            raw_obs = self.env.set_init_state(self.init_states[self.init_state_id])
+            # Exact convention in installed LIBERO/libero/lifelong/metric.py:
+            # five all-zero actions after set_init_state, including gripper.
+            for _ in range(5):
+                raw_obs, _, _, _ = self.env.step(np.zeros(7))
+        else:
+            raw_obs = self._let_objects_fall()
         self.done = False
         self.cur_step = 0
-        self._let_objects_fall()
-        return obs_dict, {'prompt': self.task_prompt}
+        return self._extract_obs(raw_obs), {
+            'prompt': self.task_prompt,
+            'episode_seed': episode_seed,
+            'init_state_id': self.init_state_id,
+            'protocol': self.protocol,
+        }
     
     def render(self, mode='rgb_array'):
         assert mode == 'rgb_array'

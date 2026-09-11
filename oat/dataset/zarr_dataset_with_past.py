@@ -17,8 +17,9 @@ class ZarrDatasetWithPastAction(ZarrDataset):
         past_action: [t-6, t-5, ..., t]               (7 frames)
         action:      [t+1, t+2, ..., t+32]            (32 frames)
 
-    At episode boundaries the SequenceSampler zero-pads, so past_action
-    is naturally all-zeros at the start of an episode.
+    By default, unavailable history repeats the first action for compatibility.
+    Set history_padding="zero" to match the policy's empty rollout buffer.
+    Observation and future-action padding always retain edge repetition.
     """
 
     def __init__(
@@ -33,6 +34,8 @@ class ZarrDatasetWithPastAction(ZarrDataset):
         seed: int = 42,
         val_ratio: float = 0.0,
         max_train_episodes: Optional[int] = None,
+        history_padding: str = "edge",
+        return_history_validity: bool = False,
     ):
         # Initialise parent — this creates the seq_sampler with the
         # original padding.  We immediately override it below.
@@ -47,7 +50,11 @@ class ZarrDatasetWithPastAction(ZarrDataset):
             max_train_episodes=max_train_episodes,
         )
 
+        if history_padding not in ("edge", "zero"):
+            raise ValueError("history_padding must be 'edge' or 'zero'")
         self.past_n = past_n
+        self.history_padding = history_padding
+        self.return_history_validity = return_history_validity
 
         # ── Extend the sampling window to include past actions ────────────
         self.pad_before = max(n_obs_steps - 1, 0) + past_n
@@ -103,6 +110,7 @@ class ZarrDatasetWithPastAction(ZarrDataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.seq_sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)
+        self._apply_history_metadata(data, idx)
 
         torch_obs = {}
         for k, v in data["obs"].items():
@@ -116,8 +124,38 @@ class ZarrDatasetWithPastAction(ZarrDataset):
         torch_act = torch.from_numpy(data["action"])
         torch_past_act = torch.from_numpy(data["past_action"])
 
-        return {
+        result = {
             "obs": torch_obs,
             "action": torch_act,
             "past_action": torch_past_act,
         }
+        for key in ("past_action_valid", "episode_step"):
+            if key in data:
+                result[key] = torch.as_tensor(data[key])
+        return result
+
+    def _apply_history_metadata(self, data, idx: int, prev_stride=None):
+        """Mask only unavailable past commands using the sampler's real bounds."""
+        if self.history_padding == "edge" and not self.return_history_validity:
+            return
+        buffer_start, _, sample_start, sample_end = self.seq_sampler.indices[idx]
+        action_start = self.pad_before
+        episode_ends = self.replay_buffer.episode_ends
+        episode = np.searchsorted(episode_ends, buffer_start, side="right")
+        episode_start = 0 if episode == 0 else episode_ends[episode - 1]
+        episode_step = int(buffer_start - episode_start + action_start - sample_start)
+        data["episode_step"] = np.int64(episode_step)
+
+        def apply(key, start):
+            positions = np.arange(start - self.past_n, start)
+            valid = (positions >= sample_start) & (positions < sample_end)
+            if self.history_padding == "zero":
+                data[key] = data[key].copy()
+                data[key][~valid] = 0.0
+            data[key + "_valid"] = valid
+
+        apply("past_action", action_start)
+        if prev_stride is not None:
+            apply("prev_past_action", action_start - prev_stride)
+            # Before this point, no complete previous rollout chunk exists.
+            data["prev_window_valid"] = np.bool_(episode_step >= prev_stride)

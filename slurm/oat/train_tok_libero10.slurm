@@ -25,7 +25,7 @@ HYDRA_FULL_ERROR=1 uv run accelerate launch \
     --multi_gpu \
     --num_processes 4 \
     scripts/run_workspace.py \
-    --config-name=train_oattok \
+    --config-name=train_oattok_so3aug \
     task/tokenizer=libero/libero10 \
     training.num_epochs=5001 \
     training.num_demo=500

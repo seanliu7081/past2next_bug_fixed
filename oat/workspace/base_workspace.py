@@ -6,6 +6,8 @@ from omegaconf import OmegaConf
 import dill
 import torch
 import threading
+import os
+import tempfile
 
 
 class BaseWorkspace:
@@ -62,10 +64,10 @@ class BaseWorkspace:
                 payload['pickles'][key] = dill.dumps(value)
         if use_thread:
             self._saving_thread = threading.Thread(
-                target=lambda : torch.save(payload, path.open('wb'), pickle_module=dill))
+                target=lambda: _atomic_torch_save(payload, path))
             self._saving_thread.start()
         else:
-            torch.save(payload, path.open('wb'), pickle_module=dill)
+            _atomic_torch_save(payload, path)
         return str(path.absolute())
     
     def get_checkpoint_path(self, tag='latest'):
@@ -131,7 +133,7 @@ class BaseWorkspace:
 
 def _copy_to_cpu(x):
     if isinstance(x, torch.Tensor):
-        return x.detach().to('cpu')
+        return x.detach().to(device='cpu', copy=True)
     elif isinstance(x, dict):
         result = dict()
         for k, v in x.items():
@@ -141,3 +143,19 @@ def _copy_to_cpu(x):
         return [_copy_to_cpu(k) for k in x]
     else:
         return copy.deepcopy(x)
+
+
+def _atomic_torch_save(payload, path):
+    """Expose a checkpoint only after serialization has finished."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + '.',
+                                         suffix='.tmp', delete=False) as stream:
+            temporary = stream.name
+            torch.save(payload, stream, pickle_module=dill)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and os.path.exists(temporary):
+            os.unlink(temporary)

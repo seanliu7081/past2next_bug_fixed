@@ -279,6 +279,7 @@ class Past2NextPolicy(BasePolicy):
         use_k_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         topk: Optional[int] = None,
+        past_actions: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         if use_k_tokens is None:
             use_k_tokens = self.max_seq_len
@@ -294,7 +295,7 @@ class Past2NextPolicy(BasePolicy):
         B = features.shape[0]
 
         # ── get or initialise past buffer ─────────────────────────────────
-        if (
+        if past_actions is None and (
             self._past_buffer is None
             or self._past_buffer.shape[0] != B
             or self._past_buffer.device != self.device
@@ -305,7 +306,13 @@ class Past2NextPolicy(BasePolicy):
             )
 
         # ── build extended condition ──────────────────────────────────────
-        cond = self._build_condition(features, self._past_buffer)
+        if past_actions is not None:
+            expected = (B, self.past_n, self.action_dim)
+            if tuple(past_actions.shape) != expected:
+                raise ValueError(f"past_actions must have shape {expected}")
+        cond = self._build_condition(
+            features, self._past_buffer if past_actions is None else past_actions
+        )
 
         # ── autoregressive generation ─────────────────────────────────────
         action_tokens = torch.full(
@@ -334,7 +341,10 @@ class Past2NextPolicy(BasePolicy):
         n_exec = self.n_action_steps
         past_n = self.past_n
 
-        if n_exec >= past_n:
+        if past_actions is not None:
+            # Explicit offline history must not alter the stateful rollout buffer.
+            pass
+        elif n_exec >= past_n:
             self._past_buffer = action_pred[:, n_exec - past_n: n_exec].detach().clone()
         else:
             self._past_buffer = torch.cat([

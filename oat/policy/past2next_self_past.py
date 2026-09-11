@@ -13,9 +13,9 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
     Past2NextPolicy that conditions on its OWN generated actions as
     `past_action` during training, instead of the dataset's ground truth.
 
-    Everything else — architecture, condition layout, loss, inference path —
-    is inherited unchanged.  The only difference from the baseline is where
-    the 7 past actions come from.
+    Architecture, condition layout, and inference remain inherited. Optional
+    optimizer-step scheduling and dataset validity metadata make the history
+    curriculum resumable and avoid inventing a previous episode-start chunk.
 
     How the self-generated past is produced
     ---------------------------------------
@@ -44,8 +44,9 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
       deliberately preserving the baseline's behaviour (the workspace's
       `model.train()` flips the frozen tokenizer back into train mode) so this
       variant stays comparable to `train_past2next`.
-    * Boundary windows are NOT zero-padded — this variant keeps the parent's
-      edge repetition, matching the baseline config.
+    * Legacy datasets retain edge repetition. With history_padding="zero",
+      unavailable commands are zero and prev_window_valid prevents generation
+      before a complete previous execution window exists.
 
     Cost
     ----
@@ -64,6 +65,12 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
     self_past_temperature   sampling temperature for the inner generation
                             (None -> self.temperature)
     self_past_topk          top-k for the inner generation (None -> self.topk)
+    self_past_schedule      "legacy" training-forward count (default), or
+                            "optimizer_step" persisted successful-update count
+    self_past_ramp_steps    linear probability ramp after warmup (default 0)
+
+    Validation can request history_mode="expert" or "generated" explicitly;
+    validation forward passes never advance either schedule.
     """
 
     def __init__(
@@ -87,6 +94,8 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
         self_past_warmup_steps: int = 500,
         self_past_temperature: Optional[float] = None,
         self_past_topk: Optional[int] = None,
+        self_past_schedule: str = "legacy",
+        self_past_ramp_steps: int = 0,
     ):
         super().__init__(
             shape_meta=shape_meta,
@@ -110,7 +119,17 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
         )
         self.self_past_topk = topk if self_past_topk is None else self_past_topk
 
-        self._train_step = 0  # incremented in forward()
+        if self_past_schedule not in ("legacy", "optimizer_step"):
+            raise ValueError("self_past_schedule must be 'legacy' or 'optimizer_step'")
+        if not 0.0 <= self_past_p <= 1.0:
+            raise ValueError("self_past_p must be between zero and one")
+        if self_past_warmup_steps < 0 or self_past_ramp_steps < 0:
+            raise ValueError("self-past warmup/ramp steps must be nonnegative")
+        self.self_past_schedule = self_past_schedule
+        self.self_past_ramp_steps = self_past_ramp_steps
+        self._train_step = 0  # Legacy training-forward schedule (never validation).
+        if self_past_schedule == "optimizer_step":
+            self.register_buffer("_self_past_optimizer_step", torch.zeros((), dtype=torch.long))
 
         print(
             f"  self-past    : p={self_past_p}, warmup={self_past_warmup_steps} steps, "
@@ -125,6 +144,41 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
         return base_name[:-1]
 
     # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        key = prefix + "_self_past_optimizer_step"
+        if self.self_past_schedule == "optimizer_step" and key not in state_dict:
+            # Historical checkpoints have no counter; a new curriculum starts at zero.
+            state_dict[key] = torch.zeros_like(self._self_past_optimizer_step)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
+
+    @property
+    def self_past_step(self):
+        if self.self_past_schedule == "optimizer_step":
+            return int(self._self_past_optimizer_step.item())
+        return self._train_step
+
+    def on_optimizer_step(self):
+        if self.training and self.self_past_schedule == "optimizer_step":
+            self._self_past_optimizer_step.add_(1)
+
+    def set_self_past_step(self, step):
+        if self.self_past_schedule == "optimizer_step":
+            self._self_past_optimizer_step.fill_(step)
+        else:
+            self._train_step = int(step)
+
+    def self_past_probability(self):
+        step = self.self_past_step
+        if step < self.self_past_warmup_steps:
+            return 0.0
+        if self.self_past_ramp_steps:
+            progress = min(1.0, (step - self.self_past_warmup_steps)
+                           / self.self_past_ramp_steps)
+            return self.self_past_p * progress
+        return self.self_past_p
 
     @contextlib.contextmanager
     def _rollout_mode(self):
@@ -211,14 +265,11 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
 
         return generated.to(dtype=prev_past.dtype)
 
-    def _maybe_self_past(self, batch, past_actions: torch.Tensor) -> torch.Tensor:
-        """
-        Replace ground-truth `past_action` with the policy's own generated past,
-        per sample with probability `self_past_p`, after warmup.
-        """
-        if self.self_past_p <= 0.0:
-            return past_actions
-        if self._train_step < self.self_past_warmup_steps:
+    def _maybe_self_past(self, batch, past_actions: torch.Tensor,
+                         probability: Optional[float] = None) -> torch.Tensor:
+        """Mix generated history only where a previous execution window exists."""
+        probability = self.self_past_probability() if probability is None else probability
+        if probability <= 0.0:
             return past_actions
         if "prev_obs" not in batch:
             raise KeyError(
@@ -226,21 +277,42 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
                 "use oat.dataset.zarr_dataset_with_prev_window.ZarrDatasetWithPrevWindow"
             )
 
-        generated = self._generate_prev_past(batch)
+        valid = batch.get("prev_window_valid")
+        if valid is None:
+            # Legacy datasets preserve their original edge-repeated generation.
+            generated = self._generate_prev_past(batch)
+        else:
+            valid = valid.to(device=past_actions.device, dtype=torch.bool).reshape(-1)
+            if not valid.any():
+                return past_actions
 
-        if self.self_past_p >= 1.0:
+            def select(value):
+                if isinstance(value, torch.Tensor):
+                    return value[valid]
+                if isinstance(value, dict):
+                    return {key: select(item) for key, item in value.items()}
+                if isinstance(value, (tuple, list)):
+                    indices = valid.nonzero(as_tuple=True)[0].tolist()
+                    return [value[index] for index in indices]
+                return value
+
+            previous = {key: select(batch[key]) for key in ("prev_obs", "prev_past_action")}
+            generated = past_actions.clone()
+            generated[valid] = self._generate_prev_past(previous)
+
+        if "past_action_valid" in batch:
+            mask = batch["past_action_valid"].to(device=past_actions.device,
+                                                dtype=torch.bool).unsqueeze(-1)
+            generated = torch.where(mask, generated, past_actions)
+        if probability >= 1.0:
             return generated
-
-        use_self = (
-            torch.rand(
-                past_actions.shape[0], 1, 1, device=past_actions.device
-            ) < self.self_past_p
-        )
+        use_self = torch.rand(past_actions.shape[0], 1, 1,
+                              device=past_actions.device) < probability
         return torch.where(use_self, generated, past_actions)
 
     # ── Training ────────────────────────────────────────────────────────────
 
-    def forward(self, batch) -> torch.Tensor:
+    def forward(self, batch, history_mode: Optional[str] = None) -> torch.Tensor:
         # tokenize ground-truth actions (frozen tokenizer)
         with torch.no_grad():
             action_tokens = self.action_tokenizer.tokenize(batch["action"])
@@ -253,7 +325,15 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
 
         # ── past actions: policy's own output instead of ground truth ─────
         past_actions = batch["past_action"]              # (B, past_n, action_dim)
-        past_actions = self._maybe_self_past(batch, past_actions)
+        if history_mode is None:
+            history_mode = ("expert" if not self.training
+                            and self.self_past_schedule == "optimizer_step" else "configured")
+        if history_mode == "generated":
+            past_actions = self._maybe_self_past(batch, past_actions, probability=1.0)
+        elif history_mode == "configured":
+            past_actions = self._maybe_self_past(batch, past_actions)
+        elif history_mode != "expert":
+            raise ValueError("history_mode must be 'expert', 'generated', or 'configured'")
 
         # ── build extended condition ──────────────────────────────────────
         cond = self._build_condition(features, past_actions)
@@ -277,7 +357,8 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
             action_tokens[:, 1:].reshape(-1),
         )
 
-        # increment step counter (used by _maybe_self_past)
-        self._train_step += 1
+        # The opt-in schedule advances only after a successful optimizer update.
+        if self.training and self.self_past_schedule == "legacy":
+            self._train_step += 1
 
         return loss

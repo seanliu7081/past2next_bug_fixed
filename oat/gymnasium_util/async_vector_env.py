@@ -6,6 +6,7 @@ import sys
 import time
 from copy import deepcopy
 from enum import Enum
+from functools import partial
 from multiprocessing import Queue
 from multiprocessing.connection import Connection
 from typing import Any, Callable, Sequence
@@ -60,6 +61,7 @@ class AsyncVectorEnv(VectorEnv):
             [int, Callable[[], Env], Connection, Connection, bool, Queue], None
         ]
         | None = None,
+        autoreset: bool = True,
     ):
         """Vectorized environment that runs multiple environments in parallel.
 
@@ -73,6 +75,9 @@ class AsyncVectorEnv(VectorEnv):
             daemon: If ``True``, then subprocesses have ``daemon`` flag turned on; that is, they will quit if
                 the head process quits. However, ``daemon=True`` prevents subprocesses to spawn children,
                 so for some environments you may want to have it set to ``False``.
+            autoreset: Whether the default worker resets after termination. Set False
+                when an episode-aware wrapper retains completed episodes. True preserves
+                the historical worker behavior for legacy evaluations.
             worker: If set, then use that worker in a subprocess instead of a default one.
                 Can be useful to override some inner vector env logic, for instance, how resets on termination or truncation are handled.
 
@@ -91,6 +96,7 @@ class AsyncVectorEnv(VectorEnv):
         self.env_fns = env_fns
         self.shared_memory = shared_memory
         self.copy = copy
+        self.autoreset = autoreset
 
         self.num_envs = len(env_fns)
 
@@ -140,7 +146,7 @@ class AsyncVectorEnv(VectorEnv):
 
         self.parent_pipes, self.processes = [], []
         self.error_queue = ctx.Queue()
-        target = worker or _async_worker
+        target = worker or partial(_async_worker, autoreset_enabled=autoreset)
         with clear_mpi_env_vars():
             for idx, env_fn in enumerate(env_fns):
                 parent_pipe, child_pipe = ctx.Pipe()
@@ -686,6 +692,7 @@ def _async_worker(
     parent_pipe: Connection,
     shared_memory: bool,
     error_queue: Queue,
+    autoreset_enabled: bool = True,
 ):
     env = env_fn()
     observation_space = env.observation_space
@@ -708,7 +715,7 @@ def _async_worker(
                     autoreset = False
                 pipe.send(((observation, info), True))
             elif command == "step":
-                if autoreset:
+                if autoreset_enabled and autoreset:
                     observation, info = env.reset()
                     reward, terminated, truncated = 0, False, False
                 else:
@@ -719,7 +726,7 @@ def _async_worker(
                         truncated,
                         info,
                     ) = env.step(data)
-                autoreset = terminated or truncated
+                autoreset = autoreset_enabled and (terminated or truncated)
 
                 if shared_memory:
                     write_to_shared_memory(

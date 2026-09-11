@@ -1,5 +1,0 @@
-mode,augment_position,max_pos_residual,max_rot_residual,verdict
-conjugate,True,9.669e-08,1.335e-07,rigid re-frame
-conjugate,False,3.999e-01,1.335e-07,not a re-frame
-left_noise,True,9.669e-08,3.889e-01,not a re-frame
-left_noise,False,3.999e-01,3.889e-01,not a re-frame

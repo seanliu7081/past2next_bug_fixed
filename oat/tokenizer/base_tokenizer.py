@@ -1,6 +1,7 @@
 import torch
 import dill
 import hydra
+from oat.common.hydra_util import register_new_resolvers
 from oat.model.common.module_attr_mixin import ModuleAttrMixin
 from typing import Optional
 
@@ -13,15 +14,15 @@ class BaseTokenizer(ModuleAttrMixin):
         output_dir: Optional[str] = None,
         return_configuration: bool = False,
     ):
-        payload = torch.load(open(checkpoint, 'rb'), pickle_module=dill)
+        with open(checkpoint, 'rb') as stream:
+            payload = torch.load(stream, pickle_module=dill, map_location='cpu')
         cfg = payload['cfg']
-        cls = hydra.utils.get_class(cfg._target_)
-        workspace = cls(cfg, output_dir=output_dir, lazy_instantiation=False)
-        workspace.load_payload(payload, exclude_keys=None, include_keys=None)
-        tokenizer = workspace.model
-        if getattr(cfg.training, "use_ema", False):
-            tokenizer = workspace.ema_model
-            
+        register_new_resolvers()
+        tokenizer = hydra.utils.instantiate(cfg.tokenizer)
+        state_key = 'ema_model' if getattr(cfg.training, 'use_ema', False) else 'model'
+        tokenizer.load_state_dict(payload['state_dicts'][state_key])
+        tokenizer.eval()
+
         if return_configuration:
             return tokenizer, cfg
         else:

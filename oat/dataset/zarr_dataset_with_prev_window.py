@@ -78,6 +78,8 @@ class ZarrDatasetWithPrevWindow(ZarrDatasetWithPastAction):
         seed: int = 42,
         val_ratio: float = 0.0,
         max_train_episodes: Optional[int] = None,
+        history_padding: str = "edge",
+        return_history_validity: bool = False,
     ):
         # Builds the parent's sampler; widened again below.
         super().__init__(
@@ -90,6 +92,8 @@ class ZarrDatasetWithPrevWindow(ZarrDatasetWithPastAction):
             seed=seed,
             val_ratio=val_ratio,
             max_train_episodes=max_train_episodes,
+            history_padding=history_padding,
+            return_history_validity=return_history_validity,
         )
 
         assert n_exec_steps >= 1, "n_exec_steps must be >= 1"
@@ -161,11 +165,17 @@ class ZarrDatasetWithPrevWindow(ZarrDatasetWithPastAction):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample = self.seq_sampler.sample_sequence(idx)
         data = self._sample_to_data(sample)
+        self._apply_history_metadata(data, idx, prev_stride=self.n_exec_steps)
 
-        return {
+        result = {
             "obs": self._obs_to_torch(data["obs"]),
             "action": torch.from_numpy(data["action"]),
             "past_action": torch.from_numpy(data["past_action"]),
             "prev_obs": self._obs_to_torch(data["prev_obs"]),
             "prev_past_action": torch.from_numpy(data["prev_past_action"]),
         }
+        for key in ("past_action_valid", "prev_past_action_valid",
+                    "episode_step", "prev_window_valid"):
+            if key in data:
+                result[key] = torch.as_tensor(data[key])
+        return result

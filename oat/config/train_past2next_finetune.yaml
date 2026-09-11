@@ -1,0 +1,40 @@
+defaults:
+  - train_past2next_improve
+  - _self_
+
+name: train_past2next_finetune
+
+# Adapt the best model gently; keep its tokenization and visual crop initially.
+policy:
+  self_past_warmup_steps: 1000
+  self_past_ramp_steps: 4000
+  temperature: 0.0
+  topk: 10
+  # Generate training history with the selected greedy deployment policy.
+  self_past_temperature: 0.0
+  self_past_topk: 10
+
+training:
+  init_checkpoint: /workspace/past2next_clean/output/20260824/093317_train_past2next_self_past_libero10_N500/checkpoints/ep-0200_sr-0.806.ckpt
+  num_epochs: 26
+  lr_warmup_steps: 100
+  snapshot_every: 1
+  checkpoint_every: 5
+  val_every: 1
+  sample_every: 1
+  # Future runs evaluate every held-out validation batch.
+  max_val_steps: null
+  max_reconst_steps: 10
+  validate_generated_history: true
+
+optimizer:
+  policy_lr: 1.0e-5
+  obs_enc_lr: 2.0e-6
+  weight_decay: 1.0e-4
+
+dataloader:
+  num_workers: 4
+
+val_dataloader:
+  # Include the final partial batch in the full validation loss.
+  drop_last: false

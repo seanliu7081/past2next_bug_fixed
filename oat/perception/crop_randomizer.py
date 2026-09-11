@@ -35,6 +35,7 @@ class CropRandomizer(nn.Module):
         self.crop_width = crop_width
         self.num_crops = num_crops
         self.pos_enc = pos_enc
+        self._training_num_crops = num_crops
 
     def output_shape_in(self, input_shape=None):
         """
@@ -89,13 +90,12 @@ class CropRandomizer(nn.Module):
                 images=inputs,
                 crop_height=self.crop_height, 
                 crop_width=self.crop_width, 
-                num_crops=self.num_crops,
+                num_crops=self._training_num_crops,
                 pos_enc=self.pos_enc,
             )
             # [B, N, ...] -> [B * N, ...]
             return tu.join_dimensions(out, 0, 1)
         else:
-            # take center crop during eval
             out = ttf.center_crop(img=inputs, output_size=(
                 self.crop_height, self.crop_width))
             if self.num_crops > 1:
@@ -110,12 +110,13 @@ class CropRandomizer(nn.Module):
         to result in shape [B, ...] to make sure the network output is consistent with
         what would have happened if there were no randomization.
         """
-        if self.num_crops <= 1:
+        num_crops = self._training_num_crops if self.training else self.num_crops
+        if num_crops <= 1:
             return inputs
         else:
-            batch_size = (inputs.shape[0] // self.num_crops)
-            out = tu.reshape_dimensions(inputs, begin_axis=0, end_axis=0, 
-                target_dims=(batch_size, self.num_crops))
+            batch_size = (inputs.shape[0] // num_crops)
+            out = tu.reshape_dimensions(inputs, begin_axis=0, end_axis=0,
+                target_dims=(batch_size, num_crops))
             return out.mean(dim=1)
     
     def forward(self, inputs):

@@ -261,8 +261,8 @@ class AutoregressiveModel(ModuleAttrMixin):
         top_k: Optional[int], if specified, use top-k sampling
         eos_id: Optional[int], if specified, stop generation when eos_id is generated
             all subsequent tokens will be set to eos_id
-        output: (B, T_pre + max_new_tokens)
-        """        
+        output: (B, T_pre + max_new_tokens), one shared sequence per environment
+        """
         # --- Pre-computation for condition ---
         T_cond = cond.shape[1]
         cond_emb = self.cond_emb(cond)
@@ -297,7 +297,7 @@ class AutoregressiveModel(ModuleAttrMixin):
         
         # --- Phase 2: Autoregressively generate new tokens ---
         out_tokens = prefix
-        finished = torch.zeros(B_mem, dtype=torch.bool, device=prefix.device) if eos_id is not None else None
+        finished = torch.zeros(prefix.shape[0], dtype=torch.bool, device=prefix.device) if eos_id is not None else None
         for i in range(max_new_tokens):
             # Sample the next token
             if temperature > 0:
