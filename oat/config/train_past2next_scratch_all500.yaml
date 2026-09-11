@@ -70,7 +70,8 @@ training:
   init_checkpoint: null
   snapshot_every: 25
   validate_generated_history: True
-  offline_validation_enabled: False
+  # offline_validation_enabled: False
+  offline_validation_enabled: True
   offline_validation_reason: all_500_supplied_demonstrations_are_training_data_no_offline_holdout
 
 ema:
@@ -109,7 +110,8 @@ task:
     dataset:
       history_padding: zero
       return_history_validity: True
-      val_ratio: 0.0
+      # val_ratio: 0.0
+      val_ratio: 0.1
       max_train_episodes: null
     env_runner:
       protocol: corrected
