@@ -1,0 +1,55 @@
+# Single-task policy: no mixed task data or simulator evaluation.
+name: real_robot_nut_washer
+task_name: nut_washer
+task_uids: [0]
+lazy_eval: true
+fps: 30
+
+shape_meta:
+  obs:
+    agentview_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eye_in_hand_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+      type: state
+    robot0_eef_rot6d:
+      shape: [6]
+      type: state
+    # Measured width in millimetres; action gripper is a separate [0, 1] command.
+    robot0_gripper_qpos:
+      shape: [1]
+      type: state
+    task_uid:
+      shape: [1]
+      type: state
+  action:
+    shape: [7]
+
+# No runner target: lazy_eval=true leaves simulator evaluation disabled.
+env_runner:
+  fps: 30
+
+dataset:
+  _target_: oat.dataset.real_robot_dataset.RealRobotZarrDatasetWithPrevWindow
+  zarr_path: /workspace/ysk/zarr/nut_washer_N62.zarr
+  obs_keys:
+    - agentview_rgb
+    - robot0_eye_in_hand_rgb
+    - robot0_eef_pos
+    - robot0_eef_rot6d
+    - robot0_gripper_qpos
+    - task_uid
+  action_key: action
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${horizon}
+  seed: ${seed}
+  val_ratio: 0.1
+  max_train_episodes: null
+  past_n: ${past_n}
+  n_exec_steps: ${n_action_steps}
+  history_padding: zero
+  return_history_validity: true

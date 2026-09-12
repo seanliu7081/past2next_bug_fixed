@@ -5,7 +5,7 @@ defaults:
 name: train_past2next_scratch_all500
 _target_: oat.workspace.train_policy.TrainPolicyWorkspace
 
-# 043 design: fresh policy/vision weights
+# 043 design: fresh policy/vision weights real robotic scenarios
 
 seed: 42
 horizon: 16

@@ -1,4 +1,6 @@
 from typing import Optional, Dict
+import json
+import math
 import os
 
 class TopKCheckpointManager:
@@ -19,6 +21,44 @@ class TopKCheckpointManager:
         self.format_str = format_str
         self.path_value_map = dict()
     
+    def restore_from_logs(self, log_path, next_epoch):
+        """Recover rankings for retained, completed checkpoints without deleting files.
+
+        The log supplies full-precision scores; rounded filenames are used only
+        to locate checkpoints. Ignore incomplete writes and epochs beyond the
+        continuation point, which may belong to an interrupted later attempt.
+        """
+        self.path_value_map = {}
+        if self.k == 0 or not os.path.isfile(log_path):
+            return 0
+        candidates = {}
+        with open(log_path) as stream:
+            for line in stream:
+                if not line.endswith('\n'):
+                    break
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                epoch = data.get('epoch')
+                value = data.get(self.monitor_key)
+                if (type(epoch) is not int or not 0 <= epoch < next_epoch
+                        or type(value) not in (int, float) or not math.isfinite(value)):
+                    continue
+                try:
+                    path = os.path.join(self.save_dir, self.format_str.format(**data))
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if os.path.isfile(path):
+                    candidates[path] = (value, epoch)
+        ranked = sorted(candidates.items(), key=lambda item: (
+            item[1][0] if self.mode == 'min' else -item[1][0],
+            -item[1][1], item[0]))
+        self.path_value_map = {path: value for path, (value, _) in ranked[:self.k]}
+        return len(self.path_value_map)
+
     def get_ckpt_path(self, data: Dict[str, float]) -> Optional[str]:
         if self.k == 0:
             return None

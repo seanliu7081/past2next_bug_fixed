@@ -18,10 +18,12 @@ sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
 import hydra
+from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 import pathlib
 from oat.workspace.base_workspace import BaseWorkspace
 from oat.common.hydra_util import register_new_resolvers
+from oat.common.policy_handoff import maybe_wait_for_policy_handoff
 
 register_new_resolvers()
 
@@ -35,6 +37,7 @@ def main(cfg: OmegaConf):
     # will use the same time.
     OmegaConf.resolve(cfg)
 
+    maybe_wait_for_policy_handoff(cfg, HydraConfig.get().runtime.output_dir)
     cls = hydra.utils.get_class(cfg._target_)
     workspace: BaseWorkspace = cls(cfg)
     workspace.run()

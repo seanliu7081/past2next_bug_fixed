@@ -1,0 +1,19 @@
+# Independent Stage 1 tokenizer for the 51 fruits demonstrations.
+name: real_robot_fruits
+task_name: fruits
+fps: 30
+
+shape_meta:
+  action:
+    shape: [7]
+
+dataset:
+  _target_: oat.dataset.real_robot_dataset.RealRobotZarrDataset
+  zarr_path: /workspace/ysk/zarr/fruits_N51.zarr
+  obs_keys: []
+  action_key: action
+  n_obs_steps: 0
+  n_action_steps: ${horizon}
+  seed: ${seed}
+  val_ratio: 0.1
+  max_train_episodes: null

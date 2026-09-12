@@ -367,6 +367,10 @@ class TrainPolicyWorkspace(BaseWorkspace):
             if latest_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {latest_ckpt_path}")
                 self._resume_training_checkpoint(latest_ckpt_path)
+                if accelerator.is_main_process:
+                    restored = topk_manager.restore_from_logs(
+                        os.path.join(self.output_dir, 'logs.json'), self.epoch)
+                    accelerator.print(f"Restored {restored} retained checkpoint rankings")
                 if self.epoch >= cfg.training.num_epochs:
                     accelerator.print(f"Already trained for {self.epoch} epochs. Exiting.")
                     return
@@ -663,9 +667,15 @@ class TrainPolicyWorkspace(BaseWorkspace):
                     # We can't copy the last checkpoint here
                     # since save_checkpoint uses threads.
                     # therefore at this point the file might have been empty!
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-                    if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
+                    if checkpoint_due and cfg.checkpoint.get("save_all", False):
+                        # Keep each scheduled checkpoint, regardless of its score.
+                        checkpoint_path = pathlib.Path(self.output_dir) / "checkpoints" / (
+                            cfg.checkpoint.topk.format_str.format(**metric_dict))
+                        self.save_checkpoint(path=checkpoint_path)
+                    else:
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                        if topk_ckpt_path is not None:
+                            self.save_checkpoint(path=topk_ckpt_path)
 
                     # restore
                     self.model = model_ddp
