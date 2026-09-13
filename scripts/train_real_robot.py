@@ -1,7 +1,7 @@
 """Train a per-dataset tokenizer, then train_past2next_scratch_all500 from scratch.
 
-Each invocation owns one dataset and one augmentation variant. Run the four
-task/variant combinations in separate output directories. Use --dry-run to
+Each invocation owns one dataset and one augmentation variant. Run each
+task/variant combination in a separate output directory. Use --dry-run to
 inspect the dataset split and exact commands without creating files or training.
 """
 import argparse
@@ -23,6 +23,7 @@ SEED = 42
 VAL_RATIO = 0.1
 DATASETS = {
     "fruits": (Path("/workspace/ysk/zarr/fruits_N51.zarr"), 51),
+    "fruits_v2": (Path("/workspace/ysk/zarr/fruits_v2_N49.zarr"), 49),
     "nut_washer": (Path("/workspace/ysk/zarr/nut_washer_N62.zarr"), 62),
 }
 VARIANTS = {
