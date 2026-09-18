@@ -87,7 +87,15 @@ Every policy config requires `policy.action_tokenizer.checkpoint`. It has no def
 path to an old run. The loaded tokenizer's weights and normalizer remain fixed;
 it stays in evaluation mode during policy training so dropout cannot change its
 token targets. Policy and vision weights, optimizer, EMA, and history curriculum
-start fresh. Policy normalizers are initialized from the dataset.
+start fresh. Both stages fit normalization statistics only on their training
+episodes, including any `max_train_episodes` cap. Validation views use the same
+training split for normalization. Keep the dataset, split seed, validation ratio
+and episode cap aligned across stages when measuring held-out performance.
+
+Checkpoint loading preserves saved normalizers, including the frozen tokenizer's
+normalizer. This fix does not recompute statistics in older checkpoints. For a
+baseline without historical normalization leakage, train a fresh tokenizer and
+then a fresh policy using the matching training split.
 
 Choose one of these commands, using a fresh output directory:
 

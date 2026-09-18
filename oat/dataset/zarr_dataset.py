@@ -68,6 +68,8 @@ class ZarrDataset(BaseDataset):
                 text_obs_keys.append(k)
 
         self.train_mask = train_mask
+        # Validation views replace train_mask; keep the fitting split unchanged.
+        self.normalization_train_mask = train_mask.copy()
         self.n_obs_steps = n_obs_steps
         self.n_action_steps = n_action_steps
         self.seq_len = seq_len
@@ -93,12 +95,25 @@ class ZarrDataset(BaseDataset):
     
 
     def get_normalizer(self, mode='limits', **kwargs):
-        data = {
-            'action': self.replay_buffer[self.action_key],
-            **{k: self.replay_buffer[k] for k in self.numeric_obs_keys}
+        """Fit on training episodes, including when called on a validation view."""
+        episode_ends = np.asarray(self.replay_buffer.episode_ends)
+        episode_lengths = np.diff(np.concatenate(([0], episode_ends)))
+        frame_mask = np.repeat(self.normalization_train_mask, episode_lengths)
+        if not frame_mask.any():
+            raise ValueError("Normalization needs at least one training frame")
+
+        frame_selection = slice(None) if frame_mask.all() else frame_mask
+        fields = {
+            'action': self.action_key,
+            **{k: k for k in self.numeric_obs_keys}
         }
         normalizer = LinearNormalizer()
-        normalizer.fit(data=data, last_n_dims=1, mode=mode, **kwargs)
+        # Fit one field at a time to avoid keeping filtered copies of all cameras.
+        for name, key in fields.items():
+            normalizer.fit(
+                data={name: self.replay_buffer[key][frame_selection]},
+                last_n_dims=1, mode=mode, **kwargs,
+            )
         return normalizer
     
 
