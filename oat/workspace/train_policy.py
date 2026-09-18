@@ -324,11 +324,6 @@ class TrainPolicyWorkspace(BaseWorkspace):
         dataset_split = self._offline_validation_metadata(
             dataset, val_dataset, cfg.training, train_dataloader, val_dataloader)
         offline_validation_enabled = dataset_split["offline_validation_enabled"]
-        if accelerator.is_main_process:
-            split_path = pathlib.Path(self.output_dir) / "dataset_split.json"
-            split_path.parent.mkdir(parents=True, exist_ok=True)
-            split_path.write_text(json.dumps(dataset_split, indent=2) + "\n")
-            accelerator.print(f"Dataset split and offline validation: {json.dumps(dataset_split)}")
 
         # configure normalizer
         normalizer = dataset.get_normalizer()
@@ -387,6 +382,15 @@ class TrainPolicyWorkspace(BaseWorkspace):
             self.model,
             self.optimizer,
         )
+        # Report the batches each process actually executes after sharding.
+        dataset_split = self._offline_validation_metadata(
+            dataset, val_dataset, cfg.training, train_dataloader, val_dataloader)
+        if accelerator.is_main_process:
+            split_path = pathlib.Path(self.output_dir) / "dataset_split.json"
+            split_path.parent.mkdir(parents=True, exist_ok=True)
+            split_path.write_text(json.dumps(dataset_split, indent=2) + "\n")
+            accelerator.print(f"Dataset split and offline validation: {json.dumps(dataset_split)}")
+
         ema = None
         if cfg.training.use_ema:
             self.ema_model = accelerator.prepare(self.ema_model)
@@ -417,9 +421,14 @@ class TrainPolicyWorkspace(BaseWorkspace):
             init_kwargs={"wandb": wandb_cfg}
         )
         if accelerator.is_main_process:
-            accelerator.get_tracker("wandb").run.config.update({
+            wandb_run = accelerator.get_tracker("wandb").run
+            wandb_run.config.update({
                 "output_dir": str(self.output_dir), "dataset_split": dataset_split,
-            })
+            }, allow_val_change=True)
+            # W&B history can extend beyond the restored checkpoint. Let W&B
+            # advance its own history step; plot against true training progress.
+            wandb_run.define_metric("global_step")
+            wandb_run.define_metric("*", step_metric="global_step")
 
         # training loop
         with JsonLogger(os.path.join(self.output_dir, 'logs.json'), filter_fn=lambda key, value:
@@ -499,7 +508,7 @@ class TrainPolicyWorkspace(BaseWorkspace):
                                     'lr': lr_scheduler.get_last_lr()[0],
                                 }
                                 if not is_last_batch:
-                                    accelerator.log(step_log, step=self.global_step)
+                                    accelerator.log(step_log)
                                     json_logger.log(step_log)
 
                             # Count every completed batch exactly once, including
@@ -685,7 +694,7 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 # end of epoch
                 # log of last step is combined with validation and rollout
                 if accelerator.is_main_process:
-                    accelerator.log(step_log, step=step_log["global_step"])
+                    accelerator.log(step_log)
                     json_logger.log(step_log)
 
         # clean up

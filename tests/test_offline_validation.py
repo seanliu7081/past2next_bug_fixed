@@ -8,9 +8,10 @@ import copy
 import json
 import math
 from pathlib import Path
-from types import SimpleNamespace
 
 from accelerate import Accelerator
+from accelerate.data_loader import BatchSamplerShard
+from accelerate.tracking import WandBTracker
 import dill
 from hydra import compose, initialize_config_dir
 import numpy as np
@@ -18,6 +19,8 @@ from omegaconf import OmegaConf
 import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
+from wandb.sdk.wandb_config import Config as WandbConfig
+from wandb.sdk.lib.config_util import ConfigError
 
 from oat.dataset.zarr_dataset_with_prev_window import ZarrDatasetWithPrevWindow
 from oat.workspace.train_policy import TrainPolicyWorkspace
@@ -73,6 +76,30 @@ class TinyPolicy(torch.nn.Module):
         return {'action_pred': self.weight.expand_as(obs['value'])}
 
 
+class RecordingWandbRun:
+    """Local history recorder with W&B's rejection of older explicit steps."""
+    def __init__(self, config=None):
+        self.config = WandbConfig() if config is None else config
+        self.step = 0
+        self.history = []
+        self.dropped_steps = []
+        self.metric_definitions = []
+
+    def define_metric(self, name, **kwargs):
+        self.metric_definitions.append((name, kwargs))
+
+    def log(self, values, step=None, **kwargs):
+        history_step = self.step if step is None else step
+        if history_step < self.step:
+            self.dropped_steps.append(history_step)
+            return
+        self.history.append({'_step': history_step, **copy.deepcopy(values)})
+        self.step = history_step + 1
+
+    def finish(self):
+        pass
+
+
 def config(config_name='train_past2next_scratch'):
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1] / 'oat/config'), version_base=None):
         cfg = compose(config_name=config_name)
@@ -93,7 +120,8 @@ def config(config_name='train_past2next_scratch'):
     return cfg
 
 
-def run_tiny(tmp_path, monkeypatch, cfg, validation_length=2, forbid_validation=False):
+def run_tiny(tmp_path, monkeypatch, cfg, validation_length=2, forbid_validation=False,
+             tracker_config=None, loader_shards=1, tracker_run=None):
     policy = TinyPolicy()
     dataset = TinyDataset(validation_length=validation_length)
     original_get_validation = dataset.get_validation_dataset
@@ -111,8 +139,26 @@ def run_tiny(tmp_path, monkeypatch, cfg, validation_length=2, forbid_validation=
     def cpu_accelerator(**kwargs):
         kwargs.pop('log_with')
         result = Accelerator(cpu=True, **kwargs)
-        tracker = SimpleNamespace(run=SimpleNamespace(config={}))
-        result.get_tracker = lambda *args, **kwargs: tracker
+        tracker = WandBTracker('local-test')
+        tracker.run = (RecordingWandbRun(tracker_config)
+                       if tracker_run is None else tracker_run)
+        # Keep the real Accelerate -> WandBTracker.log adapter while preventing
+        # W&B initialization or external configuration writes.
+        tracker.start = lambda: None
+        tracker.store_init_configuration = lambda values: None
+        result.trackers.append(tracker)
+        if loader_shards > 1:
+            original_prepare = result.prepare
+            def prepare(*objects):
+                # Exercise the real Accelerate batch sharder on CPU; model and
+                # optimizer still use a single process with no GPU or network.
+                sharded = tuple(
+                    DataLoader(obj.dataset, batch_sampler=BatchSamplerShard(
+                        obj.batch_sampler, num_processes=loader_shards, process_index=0))
+                    if isinstance(obj, DataLoader) else obj
+                    for obj in objects)
+                return original_prepare(*sharded)
+            result.prepare = prepare
         return result
     monkeypatch.setattr(training_module.hydra.utils, 'instantiate', instantiate)
     monkeypatch.setattr(training_module, 'Accelerator', cpu_accelerator)
@@ -204,6 +250,84 @@ def test_explicit_disabled_skips_both_paths_without_nan_and_saves_progress(tmp_p
     assert dill.loads(payload['pickles']['epoch']) == 1
     assert dill.loads(payload['pickles']['completed_optimizer_steps']) == 2
     assert dill.loads(payload['pickles']['global_step']) == 2
+
+
+def test_dataset_split_reports_prepared_loader_batch_counts(tmp_path, monkeypatch):
+    tracker_config = WandbConfig()
+    workspace, policy, dataset, row = run_tiny(
+        tmp_path, monkeypatch, config(), validation_length=8,
+        tracker_config=tracker_config, loader_shards=2)
+
+    split = json.loads((tmp_path / 'dataset_split.json').read_text())
+    # The unsharded loaders have two train batches and four validation batches.
+    assert split['train']['batches_per_epoch'] == policy.training_calls == 1
+    assert split['validation']['batches'] == policy.validation_calls == 2
+    assert tracker_config['dataset_split'] == split
+    assert workspace.completed_optimizer_steps == 1
+
+
+def test_resume_refreshes_stale_wandb_dataset_split(tmp_path, monkeypatch):
+    tracker_config = WandbConfig()
+    cfg = config()
+    run_tiny(tmp_path, monkeypatch, cfg, validation_length=4,
+             tracker_config=tracker_config)
+    expected_split = copy.deepcopy(tracker_config['dataset_split'])
+
+    # A previous two-GPU resume attempt may already have published the local,
+    # unsharded loader lengths. W&B normally refuses changing that saved value.
+    stale_split = copy.deepcopy(expected_split)
+    stale_split['train']['batches_per_epoch'] *= 2
+    stale_split['validation']['batches'] *= 2
+    tracker_config.update({'dataset_split': stale_split}, allow_val_change=True)
+    with pytest.raises(ConfigError, match='allow_val_change'):
+        tracker_config.update({'dataset_split': expected_split})
+
+    cfg.training.resume = True
+    cfg.training.num_epochs = 2
+    cfg.dataloader.batch_size = cfg.val_dataloader.batch_size = 1
+    workspace, policy, dataset, row = run_tiny(
+        tmp_path, monkeypatch, cfg, validation_length=4,
+        tracker_config=tracker_config, loader_shards=2)
+
+    assert workspace.epoch == 2 and workspace.completed_optimizer_steps == 4
+    assert policy.training_calls == 2
+    assert tracker_config['dataset_split'] == expected_split
+    assert json.loads((tmp_path / 'dataset_split.json').read_text()) == expected_split
+
+
+@pytest.mark.parametrize('max_train_steps', [None, 1], ids=['full-epoch', 'capped-epoch'])
+def test_resume_logs_behind_wandb_history_without_changing_training_progress(
+        tmp_path, monkeypatch, max_train_steps):
+    cfg = config()
+    cfg.training.max_train_steps = max_train_steps
+    tracker_run = RecordingWandbRun()
+    first, _, _, _ = run_tiny(tmp_path, monkeypatch, cfg, tracker_run=tracker_run)
+    steps_per_epoch = 2 if max_train_steps is None else max_train_steps
+    assert first.global_step == first.completed_optimizer_steps == steps_per_epoch
+
+    # Metrics reached the service after the last durable model checkpoint.
+    # Resume must preserve optimizer progress while appending to that history.
+    tracker_run.step = 100
+    tracker_run.history.clear()
+    tracker_run.metric_definitions.clear()
+    cfg.training.resume = True
+    cfg.training.num_epochs = 2
+    workspace, policy, dataset, row = run_tiny(
+        tmp_path, monkeypatch, cfg, tracker_run=tracker_run)
+
+    assert tracker_run.dropped_steps == []
+    assert [entry['_step'] for entry in tracker_run.history] == [100, 101]
+    expected_steps = ([2, 3] if max_train_steps is None else [1, 1])
+    assert [entry['global_step'] for entry in tracker_run.history] == expected_steps
+    assert ('global_step', {}) in tracker_run.metric_definitions
+    assert ('*', {'step_metric': 'global_step'}) in tracker_run.metric_definitions
+    assert 'val_loss' in tracker_run.history[-1]
+    assert 'test_reconst_mse' in tracker_run.history[-1]
+    assert workspace.epoch == 2
+    assert workspace.global_step == workspace.completed_optimizer_steps == 2 * steps_per_epoch
+    assert workspace.lr_scheduler_state['last_epoch'] == 2 * steps_per_epoch
+    assert all(int(state['step']) == 2 * steps_per_epoch
+               for state in workspace.optimizer.state.values())
 
 
 def test_default_empty_validation_is_rejected_before_training(tmp_path, monkeypatch):
