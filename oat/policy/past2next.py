@@ -331,8 +331,8 @@ class Past2NextPolicy(BasePolicy):
             max_new_tokens=use_k_tokens,
             temperature=temperature,
             top_k=topk,
+            bos_id=self.bos_id,
         )[:, 1:]    # drop <BOS>
-        action_tokens = action_tokens.clamp(0, self.bos_id - 1)
 
         # decode tokens -> continuous actions
         with torch.inference_mode():

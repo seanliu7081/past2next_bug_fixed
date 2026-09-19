@@ -241,8 +241,8 @@ class Past2NextSelfPastPolicy(Past2NextPolicy):
                     max_new_tokens=self.max_seq_len,
                     temperature=self.self_past_temperature,
                     top_k=self.self_past_topk,
+                    bos_id=self.bos_id,
                 )[:, 1:]    # drop <BOS>
-                tokens = tokens.clamp(0, self.bos_id - 1)
 
                 prev_pred = self.action_tokenizer.detokenize(tokens=tokens)
 

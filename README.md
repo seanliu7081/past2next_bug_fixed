@@ -131,7 +131,14 @@ output directory with `training.resume=true`.
 
 The additional `train_past2next_self_past` and `train_past2next_improve` configs are
 also standalone scratch recipes with their own architecture and schedule settings;
-both require a Stage 1 tokenizer checkpoint.
+both require a Stage 1 tokenizer checkpoint. The standalone self-past recipe
+uses zero-padded history with validity metadata and saves its optimizer-step
+counter in checkpoints. It keeps the original 1,000-update warmup followed by a
+fixed generated-history probability of 0.5 (no ramp).
+
+All Past2Next policy variants exclude BOS before sampling or greedy token
+selection, including generated history. BOS remains the input prefix; generated
+action tokens are no longer repaired by clamping after decoding the sequence.
 
 ## Multiple GPUs and simulator evaluation during training
 
@@ -175,6 +182,13 @@ For the corrected development protocol, change the protocol to `corrected`, poli
 seed to 45 and episode start seed to 4000. See the comparison document for all five
 recorded schedules and the limitations of historical legacy resets. These schedules
 are already known and reused results should be reported as retrospective checks.
+
+The older `scripts/eval_policy_sim.py` entrypoint also defaults LIBERO evaluation
+to `corrected`, overriding a checkpoint's saved legacy protocol. Pass
+`--protocol official` or `--protocol legacy` explicitly to select another reset
+protocol; the effective choice is printed and saved in `eval_log.json`. Existing
+output directories still require overwrite confirmation. Cleanup treats paths
+literally and removes output symlinks without deleting their targets.
 
 
 ## RoboCasa Sink3

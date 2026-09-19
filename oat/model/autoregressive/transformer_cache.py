@@ -251,6 +251,7 @@ class AutoregressiveModel(ModuleAttrMixin):
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         eos_id: Optional[int] = None,
+        bos_id: Optional[int] = None,
     ) -> torch.LongTensor:
         """
         Generate tokens autoregressively with KV Caching.
@@ -261,6 +262,7 @@ class AutoregressiveModel(ModuleAttrMixin):
         top_k: Optional[int], if specified, use top-k sampling
         eos_id: Optional[int], if specified, stop generation when eos_id is generated
             all subsequent tokens will be set to eos_id
+        bos_id: Optional[int], allowed in the prefix but excluded from generated tokens
         output: (B, T_pre + max_new_tokens), one shared sequence per environment
         """
         # --- Pre-computation for condition ---
@@ -299,6 +301,9 @@ class AutoregressiveModel(ModuleAttrMixin):
         out_tokens = prefix
         finished = torch.zeros(prefix.shape[0], dtype=torch.bool, device=prefix.device) if eos_id is not None else None
         for i in range(max_new_tokens):
+            # BOS only starts the sequence; never sample it into the action cache.
+            if bos_id is not None:
+                logits[..., bos_id] = -float('Inf')
             # Sample the next token
             if temperature > 0:
                 logits = logits.squeeze(1) / temperature

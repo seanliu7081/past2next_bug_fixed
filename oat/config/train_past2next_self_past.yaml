@@ -1,6 +1,6 @@
 defaults:
-  - _self_
   - task/policy: libero/libero10_with_prev_window
+  - _self_
 
 name: train_past2next_self_past
 _target_: oat.workspace.train_policy.TrainPolicyWorkspace
@@ -68,6 +68,9 @@ policy:
   # null -> reuse policy temperature / topk (what rollout actually uses)
   self_past_temperature: null
   self_past_topk: null
+  self_past_schedule: optimizer_step
+  # Preserve the original probability step after warmup.
+  self_past_ramp_steps: 0
 
 training:
   resume: False
@@ -120,6 +123,14 @@ val_dataloader:
   pin_memory: True
   persistent_workers: True
   drop_last: True
+
+task:
+  policy:
+    dataset:
+      history_padding: zero
+      return_history_validity: True
+    env_runner:
+      protocol: corrected
 
 logging:
   project: oat_dev

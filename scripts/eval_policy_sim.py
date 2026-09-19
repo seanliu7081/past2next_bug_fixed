@@ -12,13 +12,9 @@ if __name__ == "__main__":
     sys.path.insert(0, ROOT_DIR)
     os.chdir(ROOT_DIR)
 
-import sys
-# use line-buffering for both stdout and stderr
-sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
-sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
-
 import os
 import pathlib
+import shutil
 import click
 import hydra
 import torch
@@ -37,6 +33,8 @@ from typing import List, Optional
 @click.option('--temperature', default=None, type=float, help="temperature for policy inference")
 @click.option('--topk', default=None, type=int, help="topk for policy inference")
 @click.option('--use_k_tokens', default=None, type=int, help="number of tokens to use for policy inference")
+@click.option('--protocol', type=click.Choice(['corrected', 'official', 'legacy']), default=None,
+              help="LIBERO evaluation protocol; defaults to corrected regardless of the saved checkpoint. Use legacy explicitly to reproduce historical resets.")
 def eval_policy_sim(
     checkpoint: str,
     output_dir: str,
@@ -46,11 +44,17 @@ def eval_policy_sim(
     temperature: Optional[float] = None,
     topk: Optional[int] = None,
     use_k_tokens: Optional[int] = None,
+    protocol: Optional[str] = None,
 ):
-    if os.path.exists(output_dir):
+    output_path = pathlib.Path(output_dir)
+    if output_path.exists() or output_path.is_symlink():
         click.confirm(f"Output path {output_dir} already exists! Overwrite?", abort=True)
-        os.system(f"rm -rf {output_dir}")
-    pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+        # Treat paths literally and remove a symlink itself, never its target.
+        if output_path.is_symlink() or output_path.is_file():
+            output_path.unlink()
+        else:
+            shutil.rmtree(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
     
     # grab all checkpoints
     ckpts: List[str]    # file paths to checkpoints to evaluate
@@ -85,10 +89,17 @@ def eval_policy_sim(
         
         # run eval
         print(f"Running evaluation on {ckpt}")
-        env_runner: BaseRunner = hydra.utils.instantiate(
-            cfg.task.policy.env_runner,
-            output_dir=output_dir,
-        )
+        runner_cfg = cfg.task.policy.env_runner
+        is_libero = runner_cfg.get('_target_') == 'oat.env_runner.libero_runner.LiberoRunner'
+        runner_kwargs = {'output_dir': output_dir}
+        if is_libero:
+            runner_kwargs['protocol'] = protocol or 'corrected'
+        elif protocol is not None:
+            raise click.UsageError('--protocol is only supported for the LIBERO runner')
+        env_runner: BaseRunner = hydra.utils.instantiate(runner_cfg, **runner_kwargs)
+        effective_protocol = env_runner.protocol if is_libero else None
+        if is_libero:
+            print(f"LIBERO evaluation protocol: {effective_protocol}")
         
         kwargs = {}
         if temperature is not None:
@@ -139,6 +150,8 @@ def eval_policy_sim(
         json_log = dict()
         json_log['checkpoint'] = ckpt
         json_log['num_exp'] = num_exp
+        if is_libero:
+            json_log['protocol'] = effective_protocol
         
         # Add mean values
         for key, value in mean_log.items():
@@ -162,4 +175,8 @@ def eval_policy_sim(
 
 
 if __name__ == '__main__':
+    # Configure CLI logging without replacing streams when imported by callers.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(line_buffering=True)
     eval_policy_sim()
