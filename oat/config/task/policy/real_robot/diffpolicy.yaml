@@ -1,0 +1,50 @@
+# Shared single-task schema for pen/cabinet and fruit real-robot Zarr datasets.
+name: real_robot_${dataset_name}
+task_name: ${dataset_name}
+task_uids: [0]
+lazy_eval: true
+fps: 30
+
+shape_meta:
+  obs:
+    agentview_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eye_in_hand_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+      type: state
+    robot0_eef_rot6d:
+      shape: [6]
+      type: state
+    robot0_gripper_qpos:
+      shape: [1]
+      type: state
+    task_uid:
+      shape: [1]
+      type: state
+  action:
+    shape: [7]
+
+# Held-out demonstrations provide validation; no simulator is constructed.
+env_runner:
+  fps: 30
+
+dataset:
+  _target_: oat.dataset.real_robot_dataset.RealRobotZarrDataset
+  zarr_path: ${dataset_path}
+  obs_keys:
+    - agentview_rgb
+    - robot0_eye_in_hand_rgb
+    - robot0_eef_pos
+    - robot0_eef_rot6d
+    - robot0_gripper_qpos
+    - task_uid
+  action_key: action
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${horizon}
+  seed: ${seed}
+  val_ratio: 0.1
+  max_train_episodes: null
