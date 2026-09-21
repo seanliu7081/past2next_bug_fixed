@@ -42,21 +42,23 @@
 
 ```bash
 # 只解析配置，不启动训练、环境或 W&B
-bash train_state_history_live.sh --dry-run
+bash train_state_history.sh --dry-run
 
 # 默认 8 帧状态历史
-bash train_state_history_live.sh
+bash train_state_history.sh
 
 # 16 帧状态历史，同时 past_n 自动变为 15
-STATE_HISTORY_STEPS=16 bash train_state_history_live.sh
+STATE_HISTORY_STEPS=16 bash train_state_history.sh
 ```
 
 脚本默认使用 GPU 0、1，每卡 batch size 32，总 batch size 64；在线 W&B、`lazy_eval=false`、修复后的 EMA、全新 policy。默认 `NUM_EPOCHS=2001`、`ROLLOUT_EVERY=100`、`VAL_EVERY=1`，可通过同名环境变量覆盖，例如：
 
 ```bash
 NUM_EPOCHS=2001 ROLLOUT_EVERY=100 VAL_EVERY=1 \
-CUDA_VISIBLE_DEVICES=0,1 bash train_state_history_live.sh
+CUDA_VISIBLE_DEVICES=0,1 bash train_state_history.sh
 ```
+
+checkpoint 频率自动跟随 `ROLLOUT_EVERY`，只在 rollout 评估轮次保存，并全部保留。默认保存 epoch 标签 `0、100、200、…、2000`，共 21 份；epoch 0 的评估和保存发生在完成第一个训练 epoch 后。不做 top-k 淘汰，也不额外保存 `latest.ckpt` 或 snapshot。
 
 脚本复用已有 conjugate tokenizer：
 
@@ -67,7 +69,7 @@ CUDA_VISIBLE_DEVICES=0,1 bash train_state_history_live.sh
 也可显式指定 tokenizer 和输出目录：
 
 ```bash
-bash train_state_history_live.sh /path/to/tokenizer.ckpt /path/to/new_output
+bash train_state_history.sh /path/to/tokenizer.ckpt /path/to/new_output
 ```
 
 无需重转 Zarr。policy 的 normalizer 继续只统计训练 episode；冻结 tokenizer 的已有权重及其 normalizer 保持原样。`val_ratio=0.1` 保留用户设置。
@@ -85,7 +87,7 @@ H8/H16 对比会同时改变状态长度和动作历史长度，属于联合历�
 | `oat/dataset/zarr_dataset_with_state_history.py` | 当前及 previous-window 的连续状态采样 |
 | `oat/env_runner/state_history_runner.py` | 每控制步采集和向量环境快照 |
 | `oat/config/experimental/train_past2next_state_history.yaml` | 独立训练配置 |
-| `train_state_history_live.sh` | 双 GPU 启动脚本 |
+| `train_state_history.sh` | 双 GPU、在线 W&B，保留所有评估轮次 checkpoint |
 
 ## 验证范围
 

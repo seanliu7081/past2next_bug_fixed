@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Two-GPU state-history self-past training, live W&B, executed-action rollout.
+# State-history training: two GPUs, live W&B, only rollout checkpoint files.
 set -euo pipefail
 
 usage() {
     cat <<'HELP'
-Usage: bash train_state_history_live.sh [--dry-run] [TOKENIZER_CHECKPOINT [OUTPUT_DIR]]
+Usage: bash train_state_history.sh [--dry-run] [TOKENIZER_CHECKPOINT [OUTPUT_DIR]]
 
 Defaults to the existing conjugate tokenizer checkpoint (ep-1300).
 Starts a fresh policy on two GPUs with corrected EMA, W&B online, and lazy_eval=false.
 Uses batch size 32 per GPU (global batch size 64).
+Saves every rollout checkpoint, with no top-k pruning, latest file, or extra snapshots.
+Default saved epoch labels: 0, 100, 200, ..., 2000 (epoch 0 follows the first training epoch).
+Checkpoint frequency follows ROLLOUT_EVERY automatically.
 Training remains offline self-past; measured states and executed commands are used during rollout.
 STATE_HISTORY_STEPS defaults to 8 (7 past commands); set 16 for 15 past commands.
 NUM_EPOCHS=2001, ROLLOUT_EVERY=100, VAL_EVERY=1 can be overridden in the environment.
@@ -41,8 +44,9 @@ fi
 
 REPO_DIR=$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")
 TOKENIZER_PATH=$(realpath -- "$TOKENIZER_ARG")
-RUN_DIR=$(realpath -m -- "${2:-$REPO_DIR/output/training/state_history_live_seed42_$(date -u +%Y%m%d_%H%M%S_%N)}")
+RUN_DIR=$(realpath -m -- "${2:-$REPO_DIR/output/training/state_history_seed42_$(date -u +%Y%m%d_%H%M%S_%N)}")
 TRAIN_PY="${TRAIN_PY:-/venv/oat/bin/python}"
+export WANDB_MODE=online
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
@@ -66,6 +70,12 @@ ARGS=(
     "training.num_epochs=${NUM_EPOCHS:-2001}"
     "training.rollout_every=${ROLLOUT_EVERY:-100}"
     "training.val_every=${VAL_EVERY:-1}"
+    "training.checkpoint_every=${ROLLOUT_EVERY:-100}"
+    training.snapshot_every=0
+    +checkpoint.save_all=true
+    checkpoint.topk.k=0
+    checkpoint.save_last_ckpt=false
+    checkpoint.save_last_snapshot=false
     dataloader.batch_size=32
     val_dataloader.batch_size=32
     logging.mode=online
