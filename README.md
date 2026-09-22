@@ -191,6 +191,53 @@ output directories still require overwrite confirmation. Cleanup treats paths
 literally and removes output symlinks without deleting their targets.
 
 
+## Real-robot two-stage training
+
+Select the tokenizer config, dataset, and Past2Next policy config through the bash
+launcher. For the pen-cabinet dataset with tokenizer augmentation disabled:
+
+```bash
+bash train_pen_cabinet.sh \
+    --tokenizer-config oattok \
+    --dataset /workspace/ysk/zarr/pen_cabinet_lp3_N67.zarr \
+    --policy-config train_past2next_scratch_all500 \
+    --gpus 4,5
+```
+
+Add `--dry-run` to validate the dataset and inspect both resolved configs without
+training. Use `--output-dir PATH` to choose a fresh output directory. Config names
+are relative to `oat/config`; the `.yaml` suffix is optional. CLI options override
+the corresponding environment settings; `--help` lists all settings.
+
+This launcher trains the tokenizer, freezes its best held-out reconstruction
+checkpoint, then trains the selected policy. It accepts the single-task real-robot
+schema used by pen-cabinet (7D actions, two 128×128 RGB cameras, and `task_uid=0`)
+and compatible root `train_past2next*.yaml` policy recipes, plus the real-robot
+state-history gate recipe below. Both configs are resolved before training starts.
+For the root policy recipes, the launcher sets 3,001 tokenizer epochs, 1,001 policy
+epochs, per-GPU batches of 256/64, and a 90/10 episode split with seed 42.
+`TOKENIZER_EPOCHS` and `POLICY_EPOCHS` override the epoch counts. To enable SO(3)
+augmentation, select `--tokenizer-config train_oattok_so3aug`.
+
+To train a fresh tokenizer without augmentation and then the state-history gate
+policy in one run:
+
+```bash
+bash train_pen_cabinet.sh \
+    --tokenizer-config oattok \
+    --dataset /workspace/ysk/zarr/pen_cabinet_lp3_N67.zarr \
+    --policy-config experimental/train_past2next_state_history_gate_real_robot \
+    --gpus 4,5 \
+    --output-dir output/training/pen_cabinet_noaug_gate
+```
+
+The gate policy keeps its config defaults: 2,001 epochs, batch 32 per GPU,
+checkpoints every 100 epochs, and checkpoint selection by minimum `val_loss`.
+Its tokenizer comes from this run's `frozen_tokenizer.ckpt`; no pre-existing
+tokenizer checkpoint is needed. The final checkpoint check verifies frozen
+tokenizer weights and finite predictions using recorded state history and
+acknowledged demonstration commands, without connecting to a robot.
+
 ## RoboCasa Sink3
 
 The Sink3 task configs are `task/tokenizer=robocasa/sink3` and

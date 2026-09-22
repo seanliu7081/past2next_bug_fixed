@@ -77,9 +77,11 @@ def best_tokenizer_checkpoint(stage_dir):
                             "ep-{epoch:04d}_mse-{test_reconst_mse:.3f}.ckpt")
 
 
-def best_policy_checkpoint(stage_dir):
-    return _best_checkpoint(stage_dir, "test_reconst_mse",
-                            "ep-{epoch:04d}_mse-{test_reconst_mse:.6f}.ckpt")
+def best_policy_checkpoint(
+        stage_dir, *, metric_name="test_reconst_mse",
+        filename="ep-{epoch:04d}_mse-{test_reconst_mse:.6f}.ckpt"):
+    """Select a retained checkpoint using the policy recipe's minimized metric."""
+    return _best_checkpoint(stage_dir, metric_name, filename)
 
 
 def stage_command(stage, task, variant, output_dir, num_gpus, tokenizer=None,
