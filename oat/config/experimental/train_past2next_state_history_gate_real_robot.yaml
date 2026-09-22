@@ -1,0 +1,61 @@
+# @package _global_
+# Independent real-robot gate entry: rot6d pose observations and held-out demos.
+defaults:
+  - /experimental/train_past2next_state_history_gate
+  - override /task/policy: real_robot/pen_cabinet_with_prev_window
+  - _self_
+
+name: pen_cabinet_lp3_N67_gate
+state_history_keys: [robot0_eef_pos, robot0_eef_rot6d, robot0_gripper_qpos]
+
+policy:
+  _target_: oat.policy.past2next_state_history_gate_real_robot.Past2NextRealRobotStateHistoryGatePolicy
+  rotation_6d_layout: rows
+  action_tokenizer:
+    checkpoint: /workspace/ysk/past2next_bug_fixed/output/training/pen_cabinet_lp3_N67_current_20260919_213053/frozen_tokenizer.ckpt
+
+training:
+  num_demo: 67
+  num_epochs: 2001
+  val_every: 1
+  checkpoint_every: 100
+  snapshot_every: 0
+  offline_validation_enabled: true
+  offline_validation_reason: held_out_real_robot_episodes
+
+dataloader:
+  batch_size: 32
+
+val_dataloader:
+  batch_size: 32
+
+task:
+  policy:
+    name: real_robot_pen_cabinet_lp3_N67
+    task_name: pen_cabinet_lp3_N67
+    lazy_eval: true
+    env_runner: null
+    dataset:
+      _target_: oat.dataset.real_robot_state_history.RealRobotZarrDatasetWithStateHistory
+      zarr_path: /workspace/ysk/zarr/pen_cabinet_lp3_N67.zarr
+      seed: 42
+      state_history_steps: ${state_history_steps}
+      state_history_keys: ${state_history_keys}
+      history_padding: zero
+      return_history_validity: true
+
+logging:
+  project: real_robot
+  name: ${now:%Y%m%d.%H%M%S}_${name}_${policy.history_gate_mode}_seed${seed}
+  group: pen_cabinet_lp3_N67_gate
+  tags: ['${name}', '${task_name}', 'state_history_gate', 'real_robot', '${policy.history_gate_mode}']
+
+checkpoint:
+  save_all: true
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 0
+    format_str: ep-{epoch:04d}_val-{val_loss:.6f}.ckpt
+  save_last_ckpt: false
+  save_last_snapshot: false

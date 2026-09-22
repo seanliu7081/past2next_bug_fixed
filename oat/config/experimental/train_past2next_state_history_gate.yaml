@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - /experimental/train_past2next_state_history
+  - _self_
+
+name: train_past2next_state_history_gate
+
+policy:
+  _target_: oat.policy.past2next_state_history_gate.Past2NextStateHistoryGatePolicy
+  history_gate_mode: learned
+  history_gate_hidden_dim: 128
+  history_gate_init: 0.9
+
+logging:
+  tags: ['${name}', '${task_name}', 'state_history_gate', '${policy.history_gate_mode}']
