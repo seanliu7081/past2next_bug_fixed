@@ -13,8 +13,9 @@ Options (command-line values override environment settings):
   --dataset PATH          Real-robot Zarr dataset
   --policy-config NAME    Hydra Past2Next policy config (default: train_past2next_scratch_all500)
   --gpus IDS              Physical GPU indices, comma-separated
-  --output-dir PATH       Fresh output directory
-  --dry-run               Validate data and print both resolved configs
+  --output-dir PATH       Fresh output directory, or existing run with --policy-only
+  --policy-only           Start policy from a completed run's best tokenizer
+  --dry-run               Validate data and print resolved stage configs
   -h, --help              Show this help
 
 Example (tokenizer without action augmentation):
@@ -45,11 +46,21 @@ Config names are relative to oat/config; .yaml is optional.
 Dataset and output paths are relative to the caller's working directory.
 --dry-run validates the dataset and resolves both stage configs without
 starting training, creating a run directory, or initializing W&B.
+--policy-only requires --output-dir (or RUN_DIR), a completed tokenizer,
+and no existing policy output. It inherits the saved tokenizer config and
+dataset unless explicitly provided, selects by full-precision held-out MSE,
+and preserves the original launcher and command records. Combine it with
+--dry-run to validate recovery and resolve only the policy config.
 HELP
 }
 
 fail() { printf '%s\n' "$*" >&2; exit 2; }
 
+# Bash parses a function in full before executing it. Keep the entire pipeline
+# here so editing this file during tokenizer training cannot corrupt the handoff.
+main() {
+TOKENIZER_CONFIG_EXPLICIT=${TOKENIZER_CONFIG:+true}
+DATASET_PATH_EXPLICIT=${DATASET_PATH:+true}
 TRAIN_PY="${TRAIN_PY:-/venv/real_robot/bin/python}"
 TOKENIZER_CONFIG="${TOKENIZER_CONFIG:-train_oattok_so3aug}"
 POLICY_CONFIG="${POLICY_CONFIG:-train_past2next_scratch_all500}"
@@ -58,6 +69,7 @@ TRAIN_GPUS="${TRAIN_GPUS:-7}"
 TOKENIZER_EPOCHS="${TOKENIZER_EPOCHS:-3001}"
 POLICY_EPOCHS="${POLICY_EPOCHS:-}"
 DRY_RUN=false
+POLICY_ONLY=false
 while (( $# )); do
   option=${1%%=*}
   case "$option" in
@@ -72,13 +84,14 @@ while (( $# )); do
       fi
       [[ -n "$value" && "$value" != --* ]] || fail "Missing value for $option"
       case "$option" in
-        --tokenizer-config) TOKENIZER_CONFIG=$value ;;
-        --dataset) DATASET_PATH=$value ;;
+        --tokenizer-config) TOKENIZER_CONFIG=$value; TOKENIZER_CONFIG_EXPLICIT=true ;;
+        --dataset) DATASET_PATH=$value; DATASET_PATH_EXPLICIT=true ;;
         --policy-config) POLICY_CONFIG=$value ;;
         --gpus) TRAIN_GPUS=$value ;;
         --output-dir) RUN_DIR=$value ;;
       esac ;;
     --dry-run) [[ "$1" == --dry-run ]] || fail "Unexpected value for --dry-run"; DRY_RUN=true; shift ;;
+    --policy-only) [[ "$1" == --policy-only ]] || fail "Unexpected value for --policy-only"; POLICY_ONLY=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown argument: $1 (see --help)" ;;
   esac
@@ -91,6 +104,59 @@ fi
 cd -- "$(dirname -- "$SCRIPT_PATH")"
 TOKENIZER_CONFIG=${TOKENIZER_CONFIG%.yaml}
 POLICY_CONFIG=${POLICY_CONFIG%.yaml}
+if [[ "$POLICY_ONLY" == true ]]; then
+  [[ -n "${RUN_DIR:-}" ]] || fail '--policy-only requires --output-dir or RUN_DIR'
+  [[ -d "$RUN_DIR" ]] || fail "Existing run directory not found: $RUN_DIR"
+  [[ ! -e "$RUN_DIR/policy" && ! -L "$RUN_DIR/policy" ]] || fail "Refusing existing policy output: $RUN_DIR/policy"
+  # Defaults must not silently pair an existing tokenizer with a different
+  # dataset or augmentation recipe. Read saved settings before validating data.
+  RECOVERY_SETTINGS=$("$TRAIN_PY" - "$RUN_DIR" "$DATASET_PATH" "$TOKENIZER_CONFIG" \
+    "${DATASET_PATH_EXPLICIT:-false}" "${TOKENIZER_CONFIG_EXPLICIT:-false}" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+from omegaconf import OmegaConf
+
+run = Path(sys.argv[1])
+stage = run / 'tokenizer'
+cfg = OmegaConf.load(stage / '.hydra/config.yaml')
+hydra = OmegaConf.load(stage / '.hydra/hydra.yaml')
+dataset = Path(str(cfg.task.tokenizer.dataset.zarr_path)).resolve()
+config_name = str(hydra.hydra.job.config_name).removesuffix('.yaml')
+if sys.argv[4] == 'true' and Path(sys.argv[2]).resolve() != dataset:
+    raise ValueError(f'Dataset does not match saved tokenizer: {dataset}')
+if sys.argv[5] == 'true' and sys.argv[3] != config_name:
+    raise ValueError(f'Config does not match saved tokenizer: {config_name}')
+last = None
+with (stage / 'logs.json').open() as stream:
+    for line in stream:
+        if line.strip():
+            last = json.loads(line)
+final_epoch = int(cfg.training.num_epochs) - 1
+if last is None or last.get('epoch') != final_epoch:
+    raise ValueError(f'Tokenizer is incomplete: expected final epoch {final_epoch}')
+# Scheduled validation/reconstruction appear only in the completed epoch record,
+# never in intermediate minibatch records from that same epoch.
+for cadence, metric in [('val_every', 'val_loss'), ('sample_every', 'test_reconst_mse')]:
+    if final_epoch % int(cfg.training[cadence]) == 0:
+        if metric not in last or not math.isfinite(last[metric]):
+            raise ValueError(f'Tokenizer final epoch is missing finite {metric}')
+if not (run / 'tokenizer_completed.json').is_file() and all(
+        final_epoch % int(cfg.training[cadence]) != 0
+        for cadence in ('val_every', 'sample_every')):
+    raise ValueError('Cannot verify tokenizer completion without an epoch-end metric or completion marker')
+print(dataset)
+print(config_name)
+print(cfg.training.num_epochs)
+print(f'Completed tokenizer: epoch {final_epoch}; dataset {dataset}', file=sys.stderr)
+PY
+  )
+  mapfile -t RECOVERY_SETTINGS <<< "$RECOVERY_SETTINGS"
+  DATASET_PATH=${RECOVERY_SETTINGS[0]}
+  TOKENIZER_CONFIG=${RECOVERY_SETTINGS[1]}
+  TOKENIZER_EPOCHS=${RECOVERY_SETTINGS[2]}
+fi
 STATE_HISTORY_GATE=false
 if [[ "$POLICY_CONFIG" == experimental/train_past2next_state_history_gate_real_robot ]]; then
   STATE_HISTORY_GATE=true
@@ -229,27 +295,42 @@ if [[ -n "$POLICY_EPOCHS" ]]; then
 fi
 
 if [[ "$DRY_RUN" == true ]]; then
-  "$TRAIN_PY" scripts/run_workspace.py "${TOKENIZER_ARGS[@]}" --cfg job --resolve
+  if [[ "$POLICY_ONLY" == false ]]; then
+    "$TRAIN_PY" scripts/run_workspace.py "${TOKENIZER_ARGS[@]}" --cfg job --resolve
+  fi
   "$TRAIN_PY" scripts/run_workspace.py "${POLICY_ARGS[@]}" --cfg job --resolve
   exit 0
 fi
 
 # Resolve both stages before starting the expensive tokenizer training.
-"$TRAIN_PY" scripts/run_workspace.py "${TOKENIZER_ARGS[@]}" --cfg job --resolve > /dev/null
+if [[ "$POLICY_ONLY" == false ]]; then
+  "$TRAIN_PY" scripts/run_workspace.py "${TOKENIZER_ARGS[@]}" --cfg job --resolve > /dev/null
+fi
 "$TRAIN_PY" scripts/run_workspace.py "${POLICY_ARGS[@]}" --cfg job --resolve > /dev/null
 
-mkdir -p -- "$(dirname -- "$RUN")"
-mkdir -- "$RUN"
-cp -- "$SCRIPT_PATH" "$RUN/launcher.sh"
+if [[ "$POLICY_ONLY" == false ]]; then
+  mkdir -p -- "$(dirname -- "$RUN")"
+  mkdir -- "$RUN"
+fi
+exec {RUN_LOCK_FD}> "$RUN/.training.lock"
+flock -n "$RUN_LOCK_FD" || fail "Training already holds the run lock: $RUN"
+[[ ! -e "$RUN/policy" && ! -L "$RUN/policy" ]] || fail "Refusing existing policy output: $RUN/policy"
+LAUNCH_RECORD_DIR=$RUN
+if [[ "$POLICY_ONLY" == true ]]; then
+  LAUNCH_RECORD_DIR=$(mktemp -d "$RUN/policy_recovery.XXXXXXXX")
+fi
+cp -- "$SCRIPT_PATH" "$LAUNCH_RECORD_DIR/launcher.sh"
 TOKENIZER_COMMAND=("$TRAIN_PY" -m torch.distributed.run --standalone --nproc_per_node="$NPROC"
   scripts/run_workspace.py "${TOKENIZER_ARGS[@]}")
 POLICY_COMMAND=("$TRAIN_PY" -m torch.distributed.run --standalone --nproc_per_node="$NPROC"
   scripts/run_workspace.py "${POLICY_ARGS[@]}")
 {
   printf 'export CUDA_VISIBLE_DEVICES=%q WANDB_MODE=%q\n' "$CUDA_VISIBLE_DEVICES" "$WANDB_MODE"
-  printf '%q ' "${TOKENIZER_COMMAND[@]}"; printf '\n'
+  if [[ "$POLICY_ONLY" == false ]]; then
+    printf '%q ' "${TOKENIZER_COMMAND[@]}"; printf '\n'
+  fi
   printf '%q ' "${POLICY_COMMAND[@]}"; printf '\n'
-} > "$RUN/launch_commands.txt"
+} > "$LAUNCH_RECORD_DIR/launch_commands.txt"
 exec > >(tee -a "$RUN/console.log") 2>&1
 printf 'Dataset: %s (%s episodes)\n' "$DATASET_PATH" "$NUM_DEMOS"
 printf 'Configs: tokenizer=%s; policy=%s\n' "$TOKENIZER_CONFIG" "$POLICY_CONFIG"
@@ -257,19 +338,66 @@ printf 'GPUs: %s; tokenizer/policy epochs: %s/%s; W&B: %s\n' \
   "$CUDA_VISIBLE_DEVICES" "$TOKENIZER_EPOCHS" "${POLICY_EPOCHS:-policy config default}" "$WANDB_MODE"
 printf 'Images: 128x128; output: %s\n' "$RUN"
 
-"${TOKENIZER_COMMAND[@]}"
+if [[ "$POLICY_ONLY" == false ]]; then
+  "${TOKENIZER_COMMAND[@]}"
+  printf '{"num_epochs": %s}\n' "$TOKENIZER_EPOCHS" > "$RUN/tokenizer_completed.json"
+else
+  printf 'Policy-only recovery: using the completed tokenizer; records: %s\n' "$LAUNCH_RECORD_DIR"
+fi
 
 # Select using full-precision logged MSE and freeze the best tokenizer.
 "$TRAIN_PY" - "$RUN" <<'PY'
+import hashlib
+import json
+import os
+import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from scripts.train_real_robot import best_tokenizer_checkpoint
 
 run = Path(sys.argv[1])
 checkpoint, mse = best_tokenizer_checkpoint(run / 'tokenizer')
-shutil.copy2(checkpoint, run / 'frozen_tokenizer.ckpt')
-print(f'Selected tokenizer: {checkpoint} (MSE={mse:.8f})', flush=True)
+if checkpoint.stat().st_size == 0:
+    raise ValueError(f'Selected tokenizer checkpoint is empty: {checkpoint}')
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+frozen = run / 'frozen_tokenizer.ckpt'
+source_hash = sha256(checkpoint)
+with tempfile.NamedTemporaryFile(dir=run, prefix='.frozen_tokenizer.', delete=False) as stream:
+    temporary = Path(stream.name)
+try:
+    shutil.copy2(checkpoint, temporary)
+    if sha256(temporary) != source_hash:
+        raise RuntimeError('Frozen tokenizer copy failed its SHA256 check')
+    os.replace(temporary, frozen)
+finally:
+    temporary.unlink(missing_ok=True)
+selection = {
+    'source': str(checkpoint.resolve()),
+    'frozen_checkpoint': str(frozen.resolve()),
+    'epoch': int(re.search(r'ep-(\d+)_', checkpoint.name).group(1)),
+    'metric_name': 'test_reconst_mse',
+    'metric': mse,
+    'sha256': source_hash,
+}
+with tempfile.NamedTemporaryFile(mode='w', dir=run, prefix='.tokenizer_selection.',
+                                 delete=False) as stream:
+    json.dump(selection, stream, indent=2)
+    stream.write('\n')
+    temporary = Path(stream.name)
+try:
+    os.replace(temporary, run / 'tokenizer_selection.json')
+finally:
+    temporary.unlink(missing_ok=True)
+print(f'Selected tokenizer: {checkpoint} (MSE={mse:.17g}, SHA256={source_hash})', flush=True)
 PY
 
 "${POLICY_COMMAND[@]}"
@@ -297,3 +425,7 @@ if metric_name == 'test_reconst_mse':
 (run / 'checkpoint_check.json').write_text(json.dumps(report, indent=2) + '\n')
 print(json.dumps(report, indent=2), flush=True)
 PY
+}
+
+# Exit from an already parsed block without reading this file again after main.
+{ main "$@"; exit; }
