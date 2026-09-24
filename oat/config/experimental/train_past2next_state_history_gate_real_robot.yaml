@@ -18,7 +18,7 @@ training:
   num_demo: 67
   num_epochs: 2001
   val_every: 1
-  checkpoint_every: 100
+  checkpoint_every: 50
   snapshot_every: 0
   offline_validation_enabled: true
   offline_validation_reason: held_out_real_robot_episodes

@@ -31,14 +31,16 @@ Environment settings:
   TRAIN_PY         Default: /venv/real_robot/bin/python
   TOKENIZER_EPOCHS  Default: 3001
   POLICY_EPOCHS    Default: 1001; real-robot gate uses its policy config (2001)
+  POLICY_BATCH_SIZE Optional training batch per GPU (default: selected recipe)
+  VAL_RATIO        Validation fraction in (0, 1), shared by both stages (default: 0.1)
   WANDB_MODE       online or offline (default: online); project: real_robot
   RUN_DIR          Fresh output directory (default: timestamped under output/)
 
 Uses the real_robot/pen_cabinet task schema: 7D actions, two 128x128 RGB
-cameras, and task_uid=0. The split is 90/10 by episode, seed 42.
+cameras, and task_uid=0. The default split is 90/10 by episode, seed 42 (edit VAL_RATIO).
 Tokenizer batch is 256 per GPU. Standard Past2Next policies use batch 64
 and checkpoints every 50 epochs. The real-robot state-history gate preserves
-its config recipe: batch 32, checkpoints every 100 epochs, ranked by val_loss.
+its config recipe: batch 32, checkpoints every 50 epochs, ranked by val_loss.
 Supported policies: root train_past2next*.yaml recipes and
 experimental/train_past2next_state_history_gate_real_robot.
 Architecture and crops come from the selected configs.
@@ -61,6 +63,8 @@ fail() { printf '%s\n' "$*" >&2; exit 2; }
 main() {
 TOKENIZER_CONFIG_EXPLICIT=${TOKENIZER_CONFIG:+true}
 DATASET_PATH_EXPLICIT=${DATASET_PATH:+true}
+VAL_RATIO_EXPLICIT=${VAL_RATIO:+true}
+VAL_RATIO="${VAL_RATIO:-0.1}"
 TRAIN_PY="${TRAIN_PY:-/venv/real_robot/bin/python}"
 TOKENIZER_CONFIG="${TOKENIZER_CONFIG:-train_oattok_so3aug}"
 POLICY_CONFIG="${POLICY_CONFIG:-train_past2next_scratch_all500}"
@@ -111,7 +115,8 @@ if [[ "$POLICY_ONLY" == true ]]; then
   # Defaults must not silently pair an existing tokenizer with a different
   # dataset or augmentation recipe. Read saved settings before validating data.
   RECOVERY_SETTINGS=$("$TRAIN_PY" - "$RUN_DIR" "$DATASET_PATH" "$TOKENIZER_CONFIG" \
-    "${DATASET_PATH_EXPLICIT:-false}" "${TOKENIZER_CONFIG_EXPLICIT:-false}" <<'PY'
+    "${DATASET_PATH_EXPLICIT:-false}" "${TOKENIZER_CONFIG_EXPLICIT:-false}" \
+    "$VAL_RATIO" "${VAL_RATIO_EXPLICIT:-false}" <<'PY'
 import json
 import math
 import sys
@@ -128,6 +133,9 @@ if sys.argv[4] == 'true' and Path(sys.argv[2]).resolve() != dataset:
     raise ValueError(f'Dataset does not match saved tokenizer: {dataset}')
 if sys.argv[5] == 'true' and sys.argv[3] != config_name:
     raise ValueError(f'Config does not match saved tokenizer: {config_name}')
+saved_val_ratio = float(cfg.task.tokenizer.dataset.val_ratio)
+if sys.argv[7] == 'true' and float(sys.argv[6]) != saved_val_ratio:
+    raise ValueError(f'VAL_RATIO must match the saved tokenizer split: {saved_val_ratio}')
 last = None
 with (stage / 'logs.json').open() as stream:
     for line in stream:
@@ -149,6 +157,7 @@ if not (run / 'tokenizer_completed.json').is_file() and all(
 print(dataset)
 print(config_name)
 print(cfg.training.num_epochs)
+print(saved_val_ratio)
 print(f'Completed tokenizer: epoch {final_epoch}; dataset {dataset}', file=sys.stderr)
 PY
   )
@@ -156,6 +165,7 @@ PY
   DATASET_PATH=${RECOVERY_SETTINGS[0]}
   TOKENIZER_CONFIG=${RECOVERY_SETTINGS[1]}
   TOKENIZER_EPOCHS=${RECOVERY_SETTINGS[2]}
+  VAL_RATIO=${RECOVERY_SETTINGS[3]}
 fi
 STATE_HISTORY_GATE=false
 if [[ "$POLICY_CONFIG" == experimental/train_past2next_state_history_gate_real_robot ]]; then
@@ -187,6 +197,7 @@ export PYTHONUNBUFFERED=1 HYDRA_FULL_ERROR=1
 [[ "$TOKENIZER_EPOCHS" =~ ^[1-9][0-9]*$ && ( -z "$POLICY_EPOCHS" || "$POLICY_EPOCHS" =~ ^[1-9][0-9]*$ ) ]] || {
   printf 'TOKENIZER_EPOCHS and POLICY_EPOCHS must be positive integers.\n' >&2; exit 2;
 }
+[[ -z "${POLICY_BATCH_SIZE:-}" || "${POLICY_BATCH_SIZE:-}" =~ ^[1-9][0-9]*$ ]] || fail "POLICY_BATCH_SIZE must be a positive integer"
 [[ "$WANDB_MODE" == online || "$WANDB_MODE" == offline ]] || {
   printf 'WANDB_MODE must be online or offline.\n' >&2; exit 2;
 }
@@ -194,12 +205,15 @@ IFS=, read -r -a GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
 NPROC=${#GPU_IDS[@]}
 
 # Check schema and split without loading the full cameras or modifying the Zarr.
-NUM_DEMOS=$("$TRAIN_PY" - "$DATASET_PATH" "$CUDA_VISIBLE_DEVICES" <<'PY'
+NUM_DEMOS=$("$TRAIN_PY" - "$DATASET_PATH" "$CUDA_VISIBLE_DEVICES" "$VAL_RATIO" <<'PY'
 import sys
 import numpy as np
 import zarr
 from oat.common.seq_sampler import get_val_mask
 
+val_ratio = float(sys.argv[3])
+if not 0.0 < val_ratio < 1.0:
+    raise ValueError('VAL_RATIO must be greater than 0 and less than 1')
 gpu_ids = [int(value) for value in sys.argv[2].split(',')]
 if len(set(gpu_ids)) != len(gpu_ids):
     raise ValueError('TRAIN_GPUS must contain distinct GPU indices')
@@ -224,7 +238,7 @@ for key, shape in shapes.items():
         raise ValueError(f'{key} must contain finite numeric values')
 if np.unique(root['data/task_uid'][:]).tolist() != [0]:
     raise ValueError('This single-task configuration requires task_uid=0')
-val_mask = get_val_mask(len(ends), 0.1, 42)
+val_mask = get_val_mask(len(ends), val_ratio, 42)
 print(f'Dataset: {len(ends)} episodes, {int(ends[-1])} frames; '
       f'{int((~val_mask).sum())} train / {int(val_mask.sum())} validation (seed 42)',
       file=sys.stderr)
@@ -253,6 +267,7 @@ TOKENIZER_ARGS=(
   "task.tokenizer.name=$(hydra_string "real_robot_$DATASET_NAME")"
   "task.tokenizer.task_name=$(hydra_string "$DATASET_NAME")"
   "task.tokenizer.dataset.zarr_path=$(hydra_string "$DATASET_PATH")"
+  "task.tokenizer.dataset.val_ratio=$VAL_RATIO"
   "training.num_epochs=$TOKENIZER_EPOCHS"
   dataloader.batch_size=256
   val_dataloader.batch_size=128
@@ -269,6 +284,7 @@ POLICY_ARGS=(
   "task.policy.name=$(hydra_string "real_robot_$DATASET_NAME")"
   "task.policy.task_name=$(hydra_string "$DATASET_NAME")"
   "task.policy.dataset.zarr_path=$(hydra_string "$DATASET_PATH")"
+  "task.policy.dataset.val_ratio=$VAL_RATIO"
   "policy.action_tokenizer.checkpoint=$(hydra_string "$RUN/frozen_tokenizer.ckpt")"
   ++training.snapshot_every=0
   training.init_checkpoint=null
@@ -289,6 +305,9 @@ if [[ "$STATE_HISTORY_GATE" == false ]]; then
     ++checkpoint.save_all=true
     "checkpoint.topk.format_str='ep-{epoch:04d}_mse-{test_reconst_mse:.6f}.ckpt'"
   )
+fi
+if [[ -n "${POLICY_BATCH_SIZE:-}" ]]; then
+  POLICY_ARGS+=("dataloader.batch_size=$POLICY_BATCH_SIZE")
 fi
 if [[ -n "$POLICY_EPOCHS" ]]; then
   POLICY_ARGS+=("training.num_epochs=$POLICY_EPOCHS")
