@@ -35,7 +35,7 @@ def recovery_run(tmp_path):
     (run / "tokenizer/checkpoints").mkdir()
     cfg = {
         "training": {"num_epochs": 3, "val_every": 1, "sample_every": 1},
-        "task": {"tokenizer": {"dataset": {"zarr_path": str(dataset)}}},
+        "task": {"tokenizer": {"dataset": {"zarr_path": str(dataset), "val_ratio": 0.1}}},
     }
     (run / "tokenizer/.hydra/config.yaml").write_text(yaml.safe_dump(cfg))
     (run / "tokenizer/.hydra/hydra.yaml").write_text(
@@ -71,7 +71,7 @@ def fake_python(tmp_path):
             source = sys.stdin.read()
             if 'from scripts.check_real_robot_checkpoint import check_checkpoint' in source:
                 run = Path(args[1])
-                assert (run / 'policy').is_dir()
+                assert Path(args[2]).is_dir()
                 (run / 'checkpoint_check.json').write_text('{"mock_check_called": true}')
             else:
                 sys.argv = args
@@ -86,8 +86,10 @@ def fake_python(tmp_path):
                 # Reproduce editing the same inode while Bash waits for tokenizer.
                 Path(os.environ['MOCK_MUTATE_LAUNCHER']).write_text(') invalid Bash after edit\\n')
             else:
-                assert (output.parent / 'frozen_tokenizer.ckpt').read_bytes() == b'tokenizer epoch 1'
-                output.mkdir()
+                tokenizer = Path(json.loads(next(x.split('=', 1)[1] for x in args
+                                                if x.startswith('policy.action_tokenizer.checkpoint='))))
+                assert tokenizer.read_bytes() == b'tokenizer epoch 1'
+                output.mkdir(parents=True)
         else:
             # Real Hydra resolution must still validate the requested recipe.
             os.execv(sys.executable, [sys.executable, *args])
@@ -98,7 +100,7 @@ def fake_python(tmp_path):
 
 def launcher_env(tmp_path, fake_python):
     env = os.environ.copy()
-    for key in ("TOKENIZER_CONFIG", "DATASET_PATH", "TOKENIZER_EPOCHS", "POLICY_EPOCHS", "RUN_DIR"):
+    for key in ("TOKENIZER_CONFIG", "DATASET_PATH", "TOKENIZER_EPOCHS", "POLICY_EPOCHS", "RUN_DIR", "VAL_RATIO", "POLICY_BATCH_SIZE"):
         env.pop(key, None)
     env.update(TRAIN_PY=str(fake_python), WANDB_MODE="offline",
                MOCK_TRAIN_CALLS=str(tmp_path / "train_calls.jsonl"))
@@ -187,3 +189,47 @@ def test_handoff_survives_in_place_launcher_edit_during_tokenizer(
     assert (run / "frozen_tokenizer.ckpt").read_bytes() == b"tokenizer epoch 1"
     assert json.loads((run / "tokenizer_completed.json").read_text()) == {"num_epochs": 3}
     assert json.loads((run / "checkpoint_check.json").read_text())["mock_check_called"]
+
+
+def test_interrupted_tokenizer_handoff_is_explicit_and_uses_best_saved_checkpoint(
+        tmp_path, recovery_run, fake_python):
+    import zipfile
+    run, _ = recovery_run
+    log = run / "tokenizer/logs.json"
+    log.write_text("\n".join(log.read_text().splitlines()[:2]) + "\n")
+    checkpoint = run / "tokenizer/checkpoints/ep-0001_mse-0.000.ckpt"
+    with zipfile.ZipFile(checkpoint, "w") as archive:
+        archive.writestr("checkpoint/data.pkl", "fixture")
+    env = launcher_env(tmp_path, fake_python)
+    args = ["--policy-only", "--output-dir", str(run), "--dry-run"]
+    rejected = invoke(args, env)
+    assert rejected.returncode != 0
+    assert "Tokenizer is incomplete" in rejected.stderr
+    accepted = invoke([*args, "--allow-incomplete-tokenizer"], env)
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert "ep-0001_mse-0.000.ckpt" in accepted.stderr
+    assert "val_ratio: 0.1" in accepted.stdout
+    assert not (run / "policy").exists()
+    assert not (run / "frozen_tokenizer.ckpt").exists()
+    assert not Path(env["MOCK_TRAIN_CALLS"]).exists()
+
+
+def test_policy_recovery_separate_output_keeps_tokenizer_source(
+        tmp_path, recovery_run, fake_python):
+    run, _ = recovery_run
+    output = tmp_path / "training/policy/nut washer"
+    env = launcher_env(tmp_path, fake_python)
+    args = ["--policy-only", "--output-dir", str(run),
+            "--policy-output-dir", str(output)]
+    result = invoke(args, env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output.is_dir()
+    assert not (run / "policy").exists()
+    assert (run / "frozen_tokenizer.ckpt").read_bytes() == b"tokenizer epoch 1"
+    calls = [json.loads(line) for line in Path(env["MOCK_TRAIN_CALLS"]).read_text().splitlines()]
+    assert len(calls) == 1
+    assert "hydra.run.dir=" + json.dumps(str(output)) in calls[0]
+    assert "policy.action_tokenizer.checkpoint=" + json.dumps(str(run / "frozen_tokenizer.ckpt")) in calls[0]
+    rejected = invoke(args, env)
+    assert rejected.returncode != 0
+    assert "Refusing existing policy output" in rejected.stderr

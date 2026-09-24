@@ -1,0 +1,61 @@
+# @package _global_
+defaults:
+  - /train_p2n_state_gate_action_flow
+  - override /task/policy: real_robot/nut_washer_with_prev_window
+  - _self_
+
+name: train_p2n_state_gate_action_flow_real_robot
+task_type: real_robot
+state_history_keys: [robot0_eef_pos, robot0_eef_rot6d, robot0_gripper_qpos]
+
+policy:
+  rotation_6d_layout: rows
+
+action_schema:
+  control_frequency_hz: 30
+  source: REAL_ROBOT_TRAINING.md; scripts/train_real_robot.py:ACTION_SEMANTICS
+  translation:
+    representation: delta_position
+    frame: base
+    units: metres
+    integration: p_next = p_previous + dp
+  rotation:
+    representation: rotation_vector_delta
+    frame: end_effector
+    units: radians
+    integration: R_next = R_previous @ Exp(drotvec)
+  gripper:
+    representation: absolute_command
+    units: unitless
+    open: 0.0
+    closed: 1.0
+  gripper_observation:
+    representation: measured_width
+    units: millimetres
+  controller_postprocessing: external_controller_record_actual_sent_commands
+
+training:
+  num_demo: 77
+  num_epochs: 2001
+  checkpoint_every: 50
+  snapshot_every: 50
+  offline_validation_reason: held_out_nut_washer_v3_N77_episodes
+
+task:
+  policy:
+    name: real_robot_nut_washer_v3_N77
+    task_name: nut_washer_v3_N77
+    lazy_eval: true
+    env_runner: null
+    dataset:
+      _target_: oat.dataset.action_flow_dataset.ActionFlowRealRobotZarrDatasetWithStateHistory
+      zarr_path: /workspace/ysk/zarr/nut_washer_v3_N77.zarr
+      val_ratio: 0.05
+      seed: 42
+      state_history_steps: ${state_history_steps}
+      state_history_keys: ${state_history_keys}
+      history_padding: zero
+      return_history_validity: true
+
+logging:
+  project: real_robot_p2n_action_flow

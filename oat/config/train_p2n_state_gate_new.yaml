@@ -1,0 +1,33 @@
+defaults:
+  - train_p2n_new
+  - _self_
+
+name: train_p2n_state_gate_new
+variant: p2n_state_gate_new
+state_history_steps: 8
+state_history_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
+
+policy:
+  _target_: oat.policy.p2n_state_gate_new.P2NStateGateNewPolicy
+  state_history_steps: ${state_history_steps}
+  state_history_keys: ${state_history_keys}
+  history_embed_dim: 128
+  history_n_heads: 4
+  history_n_layers: 2
+  history_summary_tokens: 4
+  history_dropout: 0.1
+  history_gate_mode: learned
+  history_gate_hidden_dim: 128
+  history_gate_init: 0.9
+  rotation_6d_layout: rows
+
+task:
+  policy:
+    dataset:
+      _target_: oat.dataset.zarr_dataset_with_state_history.ZarrDatasetWithStateHistory
+      state_history_steps: ${state_history_steps}
+      state_history_keys: ${state_history_keys}
+    env_runner:
+      _target_: oat.env_runner.p2n_new_runner.P2NStateGateNewLiberoRunner
+      state_history_steps: ${state_history_steps}
+      state_history_keys: ${state_history_keys}

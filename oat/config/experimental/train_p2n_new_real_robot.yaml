@@ -1,0 +1,35 @@
+# @package _global_
+defaults:
+  - /train_p2n_new
+  - override /task/policy: real_robot/nut_washer_with_prev_window
+  - _self_
+
+name: train_p2n_new_real_robot
+task_type: real_robot
+
+policy:
+  tokenizer_checkpoint: /workspace/ysk/past2next_bug_fixed/output/training/nut_washer_v3_N77_gated_so3aug_20260924_081008_317043427/tokenizer/checkpoints/ep-1540_mse-0.000.ckpt
+
+training:
+  num_demo: 77
+  num_epochs: 2001
+  checkpoint_every: 50
+  snapshot_every: 50
+  offline_validation_reason: held_out_nut_washer_v3_N77_episodes
+
+task:
+  policy:
+    name: real_robot_nut_washer_v3_N77
+    task_name: nut_washer_v3_N77
+    lazy_eval: true
+    env_runner: null
+    dataset:
+      _target_: oat.dataset.real_robot_dataset.RealRobotZarrDatasetWithPrevWindow
+      zarr_path: /workspace/ysk/zarr/nut_washer_v3_N77.zarr
+      val_ratio: 0.05
+      seed: 42
+      history_padding: zero
+      return_history_validity: true
+
+logging:
+  project: real_robot_p2n_new

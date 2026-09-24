@@ -1,0 +1,1341 @@
+{
+  "schema_version": 1,
+  "validation_scope": "Complete CPU-instantiated production architectures, selected OAT EMA strictly loaded, actual nut_washer_v3_N77 training normalizer. DINO architecture only; pretrained DINO weights were not available, no forward, GPU training, latency or DDP acceptance performed.",
+  "real_dino_weights_validated": false,
+  "reports": [
+    {
+      "status": "architecture_count_only",
+      "real_dino_weights_validated": false,
+      "variant": "p2n_new",
+      "task": "real_robot",
+      "rank": 0,
+      "world_size": 1,
+      "device": "cpu",
+      "precision": "not_executed",
+      "validation_weights": "raw",
+      "training_timing_includes_gradient_checks": true,
+      "metadata": {
+        "variant": "p2n_new",
+        "policy_target": "oat.policy.p2n_new.P2NNewPolicy",
+        "task": "real_robot",
+        "context_schema": 1,
+        "execution_protocol": "acknowledged_commands_v1",
+        "segments": {
+          "VISUAL": 0,
+          "PROPRIO": 1,
+          "RAW_ACTION": 2,
+          "ACTION_DIFF": 3,
+          "HISTORY_SUMMARY": 4
+        },
+        "shape_meta": {
+          "obs": {
+            "agentview_rgb": {
+              "shape": [
+                128,
+                128,
+                3
+              ],
+              "type": "rgb"
+            },
+            "robot0_eye_in_hand_rgb": {
+              "shape": [
+                128,
+                128,
+                3
+              ],
+              "type": "rgb"
+            },
+            "robot0_eef_pos": {
+              "shape": [
+                3
+              ],
+              "type": "state"
+            },
+            "robot0_eef_rot6d": {
+              "shape": [
+                6
+              ],
+              "type": "state"
+            },
+            "robot0_gripper_qpos": {
+              "shape": [
+                1
+              ],
+              "type": "state"
+            },
+            "task_uid": {
+              "shape": [
+                1
+              ],
+              "type": "state"
+            }
+          },
+          "action": {
+            "shape": [
+              7
+            ]
+          }
+        },
+        "tokenizer": {
+          "source": "/workspace/ysk/past2next_bug_fixed/output/training/nut_washer_v3_N77_gated_so3aug_20260924_081008_317043427/tokenizer/checkpoints/ep-1540_mse-0.000.ckpt",
+          "sha256": "3ed93e731c35355194f7ab01a3c5c7cbd8a86cbb16b911d36a393d2f12f1e946",
+          "weights": "ema"
+        },
+        "vocab_size": 5001,
+        "latent_horizon": 8,
+        "horizon": 16,
+        "n_action_steps": 8,
+        "parameters": {
+          "total": 201571654,
+          "trainable": 174170112,
+          "frozen": 27401542
+        },
+        "software": {
+          "torch": "2.10.0",
+          "torchvision": "0.25.0",
+          "transformers": "4.57.6",
+          "accelerate": "1.12.0"
+        },
+        "self_past_optimizer_updates": 0,
+        "architecture": {
+          "_target_": "oat.policy.p2n_new.P2NNewPolicy",
+          "_recursive_": false,
+          "shape_meta": {
+            "obs": {
+              "agentview_rgb": {
+                "shape": [
+                  128,
+                  128,
+                  3
+                ],
+                "type": "rgb"
+              },
+              "robot0_eye_in_hand_rgb": {
+                "shape": [
+                  128,
+                  128,
+                  3
+                ],
+                "type": "rgb"
+              },
+              "robot0_eef_pos": {
+                "shape": [
+                  3
+                ],
+                "type": "state"
+              },
+              "robot0_eef_rot6d": {
+                "shape": [
+                  6
+                ],
+                "type": "state"
+              },
+              "robot0_gripper_qpos": {
+                "shape": [
+                  1
+                ],
+                "type": "state"
+              },
+              "task_uid": {
+                "shape": [
+                  1
+                ],
+                "type": "state"
+              }
+            },
+            "action": {
+              "shape": [
+                7
+              ]
+            }
+          },
+          "variant": "p2n_new",
+          "task": "real_robot",
+          "n_action_steps": 8,
+          "n_obs_steps": 2,
+          "past_n": 7,
+          "horizon": 16,
+          "embed_dim": 768,
+          "n_layers": 16,
+          "n_heads": 12,
+          "ffn_dim": 2048,
+          "dropout": 0.1,
+          "temperature": 0.0,
+          "topk": 10,
+          "activation_checkpointing": false,
+          "self_past_p": 0.5,
+          "self_past_warmup_steps": 1000,
+          "self_past_ramp_steps": 4000,
+          "self_past_chunk_size": 4,
+          "self_past_temperature": 1.0,
+          "self_past_topk": 10,
+          "self_past_schedule": "optimizer_step",
+          "construction_mode": "restore",
+          "obs_encoder_config": {
+            "shape_meta": {
+              "obs": {
+                "agentview_rgb": {
+                  "shape": [
+                    128,
+                    128,
+                    3
+                  ],
+                  "type": "rgb"
+                },
+                "robot0_eye_in_hand_rgb": {
+                  "shape": [
+                    128,
+                    128,
+                    3
+                  ],
+                  "type": "rgb"
+                },
+                "robot0_eef_pos": {
+                  "shape": [
+                    3
+                  ],
+                  "type": "state"
+                },
+                "robot0_eef_rot6d": {
+                  "shape": [
+                    6
+                  ],
+                  "type": "state"
+                },
+                "robot0_gripper_qpos": {
+                  "shape": [
+                    1
+                  ],
+                  "type": "state"
+                },
+                "task_uid": {
+                  "shape": [
+                    1
+                  ],
+                  "type": "state"
+                }
+              },
+              "action": {
+                "shape": [
+                  7
+                ]
+              }
+            },
+            "n_obs_steps": 2,
+            "n_emb": 768,
+            "n_head": 12,
+            "ffn_dim": 2048,
+            "num_queries": 64,
+            "resampler_depth": 2,
+            "dropout": 0.1,
+            "activation_checkpointing": false,
+            "dino": {
+              "load_mode": "restore",
+              "model_id": "facebook/dinov3-vits16-pretrain-lvd1689m",
+              "config": {
+                "return_dict": true,
+                "output_hidden_states": false,
+                "torchscript": false,
+                "dtype": null,
+                "pruned_heads": {},
+                "tie_word_embeddings": true,
+                "chunk_size_feed_forward": 0,
+                "is_encoder_decoder": false,
+                "is_decoder": false,
+                "cross_attention_hidden_size": null,
+                "add_cross_attention": false,
+                "tie_encoder_decoder": false,
+                "architectures": null,
+                "finetuning_task": null,
+                "id2label": {
+                  "0": "LABEL_0",
+                  "1": "LABEL_1"
+                },
+                "label2id": {
+                  "LABEL_0": 0,
+                  "LABEL_1": 1
+                },
+                "task_specific_params": null,
+                "problem_type": null,
+                "tokenizer_class": null,
+                "prefix": null,
+                "bos_token_id": null,
+                "pad_token_id": null,
+                "eos_token_id": null,
+                "sep_token_id": null,
+                "decoder_start_token_id": null,
+                "max_length": 20,
+                "min_length": 0,
+                "do_sample": false,
+                "early_stopping": false,
+                "num_beams": 1,
+                "temperature": 1.0,
+                "top_k": 50,
+                "top_p": 1.0,
+                "typical_p": 1.0,
+                "repetition_penalty": 1.0,
+                "length_penalty": 1.0,
+                "no_repeat_ngram_size": 0,
+                "encoder_no_repeat_ngram_size": 0,
+                "bad_words_ids": null,
+                "num_return_sequences": 1,
+                "output_scores": false,
+                "return_dict_in_generate": false,
+                "forced_bos_token_id": null,
+                "forced_eos_token_id": null,
+                "remove_invalid_values": false,
+                "exponential_decay_length_penalty": null,
+                "suppress_tokens": null,
+                "begin_suppress_tokens": null,
+                "num_beam_groups": 1,
+                "diversity_penalty": 0.0,
+                "_name_or_path": "",
+                "transformers_version": "4.57.6",
+                "tf_legacy_loss": false,
+                "use_bfloat16": false,
+                "image_size": 224,
+                "patch_size": 16,
+                "num_channels": 3,
+                "hidden_size": 384,
+                "intermediate_size": 1536,
+                "num_hidden_layers": 12,
+                "num_attention_heads": 6,
+                "hidden_act": "gelu",
+                "attention_dropout": 0.0,
+                "initializer_range": 0.02,
+                "layer_norm_eps": 1e-05,
+                "layerscale_value": 1.0,
+                "drop_path_rate": 0.0,
+                "use_gated_mlp": false,
+                "rope_theta": 100.0,
+                "query_bias": true,
+                "key_bias": false,
+                "value_bias": true,
+                "proj_bias": true,
+                "mlp_bias": true,
+                "num_register_tokens": 4,
+                "pos_embed_shift": null,
+                "pos_embed_jitter": null,
+                "pos_embed_rescale": 2.0,
+                "model_type": "dinov3_vit",
+                "output_attentions": false
+              },
+              "processor_config": {
+                "_processor_class": null,
+                "size": {
+                  "height": 224,
+                  "width": 224
+                },
+                "crop_size": null,
+                "pad_size": null,
+                "do_resize": true,
+                "default_to_square": true,
+                "resample": 2,
+                "do_center_crop": null,
+                "do_rescale": true,
+                "rescale_factor": 0.00392156862745098,
+                "do_normalize": true,
+                "image_mean": [
+                  0.485,
+                  0.456,
+                  0.406
+                ],
+                "image_std": [
+                  0.229,
+                  0.224,
+                  0.225
+                ],
+                "do_pad": null,
+                "do_convert_rgb": null,
+                "return_tensors": null,
+                "data_format": "channels_first",
+                "input_data_format": null,
+                "device": null,
+                "disable_grouping": null,
+                "image_processor_type": "DINOv3ViTImageProcessorFast"
+              },
+              "revision": null,
+              "weight_sha256": null,
+              "rgb_range": "uint8",
+              "image_size": 224,
+              "geometry": "square_resize",
+              "interpolation": "bicubic",
+              "antialias": true,
+              "brightness": 0.1,
+              "contrast": 0.1
+            }
+          },
+          "tokenizer_config": {
+            "_target_": "oat.tokenizer.oat.tokenizer_so3_aug.OATTokSO3Aug",
+            "action_aug": {
+              "_target_": "oat.tokenizer.oat.augment.so3_action_chunk_aug.SO3ActionChunkAug",
+              "p": 0.6,
+              "max_angle_deg": 30.0,
+              "mode": "conjugate",
+              "augment_position": true,
+              "pos_start": 0,
+              "pos_end": 3,
+              "rot_start": 3,
+              "rot_end": 6
+            },
+            "encoder": {
+              "_target_": "oat.tokenizer.oat.encoder.register_encoder.RegisterEncoder",
+              "sample_dim": 7,
+              "sample_horizon": 16,
+              "emb_dim": 256,
+              "head_dim": 64,
+              "depth": 2,
+              "pdropout": 0.1,
+              "latent_dim": 5,
+              "num_registers": 8
+            },
+            "decoder": {
+              "_target_": "oat.tokenizer.oat.decoder.single_pass_decoder.SinglePassDecoder",
+              "sample_dim": 7,
+              "sample_horizon": 16,
+              "emb_dim": 256,
+              "head_dim": 64,
+              "depth": 4,
+              "pdropout": 0.1,
+              "token_dropout_mode": "pow2",
+              "latent_dim": 5,
+              "latent_horizon": 8,
+              "use_causal_decoder": true
+            },
+            "quantizer": {
+              "_target_": "oat.tokenizer.oat.quantizer.fsq.FSQ",
+              "levels": [
+                8,
+                5,
+                5,
+                5,
+                5
+              ]
+            }
+          },
+          "tokenizer_metadata": {
+            "source": "/workspace/ysk/past2next_bug_fixed/output/training/nut_washer_v3_N77_gated_so3aug_20260924_081008_317043427/tokenizer/checkpoints/ep-1540_mse-0.000.ckpt",
+            "sha256": "3ed93e731c35355194f7ab01a3c5c7cbd8a86cbb16b911d36a393d2f12f1e946",
+            "weights": "ema"
+          }
+        },
+        "initialization": "AR normal(0,.02), residual outputs .02/sqrt(3*depth)",
+        "source_sha256": {
+          "oat/policy/p2n_new_common.py": "6070d6101a4e1f39a8f315601832e749fd4d05a7b2b56f9a115a9ec80fa700fc",
+          "oat/policy/p2n_new.py": "91031466c4f65ff67b648c000e0276d141d68ab5da39904fc457e9c0a054a68d",
+          "oat/policy/p2n_state_gate_new.py": "fc463d7703ccf495e3c726e3b5a87287231bbed00a78f2cb14a41786bf5953ea",
+          "oat/model/autoregressive/modern_transformer_cache.py": "5a3c8347a7adaca8e1537cd8f1c86d2aa304205ae525f196e57a9e1b10d3ad72",
+          "oat/model/common/context_batch.py": "231db4bc69c7b34dc67afcca5cca6e467ef42785279eb5f13e4248e04e7bce3b",
+          "oat/perception/token_obs_encoder.py": "e3de6f4e681e4fbe4c85d0c7ebdeddc02a77c9ca336a776d570f6990e925c8f0",
+          "oat/perception/dinov3_patch_encoder.py": "4d786e2766141a43d04235631f77fa51a72ac9801fb3e17d36da49f07217bd28",
+          "oat/perception/visual_resampler.py": "df79bff91e0d424910b40df42feca1dc2e904545af4d93fb65c854503d13316a"
+        }
+      },
+      "dataset": {
+        "path": "/workspace/ysk/zarr/nut_washer_v3_N77.zarr",
+        "train_windows": 93980,
+        "validation_windows": 5269,
+        "train_episode_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          59,
+          60,
+          61,
+          62,
+          63,
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71,
+          72,
+          73,
+          74,
+          75,
+          76
+        ],
+        "validation_episode_ids": [
+          6,
+          33,
+          49,
+          58
+        ],
+        "normalizer_source": "actual_training_episode_mask",
+        "preflight": {
+          "schema_version": 1,
+          "data_path": "/workspace/ysk/zarr/nut_washer_v3_N77.zarr",
+          "val_ratio": 0.05,
+          "seed": 42,
+          "train_episode_ids": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47,
+            48,
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            59,
+            60,
+            61,
+            62,
+            63,
+            64,
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71,
+            72,
+            73,
+            74,
+            75,
+            76
+          ],
+          "validation_episode_ids": [
+            6,
+            33,
+            49,
+            58
+          ],
+          "train": {
+            "episodes": 73,
+            "windows": 93980
+          },
+          "validation": {
+            "episodes": 4,
+            "windows": 5269
+          },
+          "offline_validation_enabled": true
+        }
+      },
+      "component_parameters": {
+        "action_tokenizer": {
+          "total": 5804854,
+          "trainable": 0
+        },
+        "obs_encoder": {
+          "total": 40855424,
+          "trainable": 19258880
+        },
+        "action_normalizer": {
+          "total": 144,
+          "trainable": 0
+        },
+        "raw_proj": {
+          "total": 6144,
+          "trainable": 6144
+        },
+        "acc_proj": {
+          "total": 6144,
+          "trainable": 6144
+        },
+        "jerk_proj": {
+          "total": 6144,
+          "trainable": 6144
+        },
+        "model": {
+          "total": 154883584,
+          "trainable": 154883584
+        }
+      },
+      "module_tree": [
+        "action_tokenizer",
+        "obs_encoder",
+        "action_normalizer",
+        "raw_proj",
+        "acc_proj",
+        "jerk_proj",
+        "model"
+      ],
+      "limitation": "DINO architecture only: no approved pretrained DINO weights loaded, no forward/training/GPU acceptance performed."
+    },
+    {
+      "status": "architecture_count_only",
+      "real_dino_weights_validated": false,
+      "variant": "p2n_state_gate_new",
+      "task": "real_robot",
+      "rank": 0,
+      "world_size": 1,
+      "device": "cpu",
+      "precision": "not_executed",
+      "validation_weights": "raw",
+      "training_timing_includes_gradient_checks": true,
+      "metadata": {
+        "variant": "p2n_state_gate_new",
+        "policy_target": "oat.policy.p2n_state_gate_new.P2NStateGateNewPolicy",
+        "task": "real_robot",
+        "context_schema": 1,
+        "execution_protocol": "acknowledged_commands_v1",
+        "segments": {
+          "VISUAL": 0,
+          "PROPRIO": 1,
+          "RAW_ACTION": 2,
+          "ACTION_DIFF": 3,
+          "HISTORY_SUMMARY": 4
+        },
+        "shape_meta": {
+          "obs": {
+            "agentview_rgb": {
+              "shape": [
+                128,
+                128,
+                3
+              ],
+              "type": "rgb"
+            },
+            "robot0_eye_in_hand_rgb": {
+              "shape": [
+                128,
+                128,
+                3
+              ],
+              "type": "rgb"
+            },
+            "robot0_eef_pos": {
+              "shape": [
+                3
+              ],
+              "type": "state"
+            },
+            "robot0_eef_rot6d": {
+              "shape": [
+                6
+              ],
+              "type": "state"
+            },
+            "robot0_gripper_qpos": {
+              "shape": [
+                1
+              ],
+              "type": "state"
+            },
+            "task_uid": {
+              "shape": [
+                1
+              ],
+              "type": "state"
+            }
+          },
+          "action": {
+            "shape": [
+              7
+            ]
+          }
+        },
+        "tokenizer": {
+          "source": "/workspace/ysk/past2next_bug_fixed/output/training/nut_washer_v3_N77_gated_so3aug_20260924_081008_317043427/tokenizer/checkpoints/ep-1540_mse-0.000.ckpt",
+          "sha256": "3ed93e731c35355194f7ab01a3c5c7cbd8a86cbb16b911d36a393d2f12f1e946",
+          "weights": "ema"
+        },
+        "vocab_size": 5001,
+        "latent_horizon": 8,
+        "horizon": 16,
+        "n_action_steps": 8,
+        "parameters": {
+          "total": 203523657,
+          "trainable": 176122115,
+          "frozen": 27401542
+        },
+        "software": {
+          "torch": "2.10.0",
+          "torchvision": "0.25.0",
+          "transformers": "4.57.6",
+          "accelerate": "1.12.0"
+        },
+        "self_past_optimizer_updates": 0,
+        "architecture": {
+          "_target_": "oat.policy.p2n_state_gate_new.P2NStateGateNewPolicy",
+          "_recursive_": false,
+          "shape_meta": {
+            "obs": {
+              "agentview_rgb": {
+                "shape": [
+                  128,
+                  128,
+                  3
+                ],
+                "type": "rgb"
+              },
+              "robot0_eye_in_hand_rgb": {
+                "shape": [
+                  128,
+                  128,
+                  3
+                ],
+                "type": "rgb"
+              },
+              "robot0_eef_pos": {
+                "shape": [
+                  3
+                ],
+                "type": "state"
+              },
+              "robot0_eef_rot6d": {
+                "shape": [
+                  6
+                ],
+                "type": "state"
+              },
+              "robot0_gripper_qpos": {
+                "shape": [
+                  1
+                ],
+                "type": "state"
+              },
+              "task_uid": {
+                "shape": [
+                  1
+                ],
+                "type": "state"
+              }
+            },
+            "action": {
+              "shape": [
+                7
+              ]
+            }
+          },
+          "variant": "p2n_state_gate_new",
+          "task": "real_robot",
+          "n_action_steps": 8,
+          "n_obs_steps": 2,
+          "past_n": 7,
+          "horizon": 16,
+          "embed_dim": 768,
+          "n_layers": 16,
+          "n_heads": 12,
+          "ffn_dim": 2048,
+          "dropout": 0.1,
+          "temperature": 0.0,
+          "topk": 10,
+          "activation_checkpointing": false,
+          "self_past_p": 0.5,
+          "self_past_warmup_steps": 1000,
+          "self_past_ramp_steps": 4000,
+          "self_past_chunk_size": 4,
+          "self_past_temperature": 1.0,
+          "self_past_topk": 10,
+          "self_past_schedule": "optimizer_step",
+          "state_history_steps": 8,
+          "state_history_keys": [
+            "robot0_eef_pos",
+            "robot0_eef_rot6d",
+            "robot0_gripper_qpos"
+          ],
+          "history_embed_dim": 128,
+          "history_n_heads": 4,
+          "history_n_layers": 2,
+          "history_summary_tokens": 4,
+          "history_dropout": 0.1,
+          "history_gate_mode": "learned",
+          "history_gate_hidden_dim": 128,
+          "history_gate_init": 0.9,
+          "rotation_6d_layout": "rows",
+          "construction_mode": "restore",
+          "obs_encoder_config": {
+            "shape_meta": {
+              "obs": {
+                "agentview_rgb": {
+                  "shape": [
+                    128,
+                    128,
+                    3
+                  ],
+                  "type": "rgb"
+                },
+                "robot0_eye_in_hand_rgb": {
+                  "shape": [
+                    128,
+                    128,
+                    3
+                  ],
+                  "type": "rgb"
+                },
+                "robot0_eef_pos": {
+                  "shape": [
+                    3
+                  ],
+                  "type": "state"
+                },
+                "robot0_eef_rot6d": {
+                  "shape": [
+                    6
+                  ],
+                  "type": "state"
+                },
+                "robot0_gripper_qpos": {
+                  "shape": [
+                    1
+                  ],
+                  "type": "state"
+                },
+                "task_uid": {
+                  "shape": [
+                    1
+                  ],
+                  "type": "state"
+                }
+              },
+              "action": {
+                "shape": [
+                  7
+                ]
+              }
+            },
+            "n_obs_steps": 2,
+            "n_emb": 768,
+            "n_head": 12,
+            "ffn_dim": 2048,
+            "num_queries": 64,
+            "resampler_depth": 2,
+            "dropout": 0.1,
+            "activation_checkpointing": false,
+            "dino": {
+              "load_mode": "restore",
+              "model_id": "facebook/dinov3-vits16-pretrain-lvd1689m",
+              "config": {
+                "return_dict": true,
+                "output_hidden_states": false,
+                "torchscript": false,
+                "dtype": null,
+                "pruned_heads": {},
+                "tie_word_embeddings": true,
+                "chunk_size_feed_forward": 0,
+                "is_encoder_decoder": false,
+                "is_decoder": false,
+                "cross_attention_hidden_size": null,
+                "add_cross_attention": false,
+                "tie_encoder_decoder": false,
+                "architectures": null,
+                "finetuning_task": null,
+                "id2label": {
+                  "0": "LABEL_0",
+                  "1": "LABEL_1"
+                },
+                "label2id": {
+                  "LABEL_0": 0,
+                  "LABEL_1": 1
+                },
+                "task_specific_params": null,
+                "problem_type": null,
+                "tokenizer_class": null,
+                "prefix": null,
+                "bos_token_id": null,
+                "pad_token_id": null,
+                "eos_token_id": null,
+                "sep_token_id": null,
+                "decoder_start_token_id": null,
+                "max_length": 20,
+                "min_length": 0,
+                "do_sample": false,
+                "early_stopping": false,
+                "num_beams": 1,
+                "temperature": 1.0,
+                "top_k": 50,
+                "top_p": 1.0,
+                "typical_p": 1.0,
+                "repetition_penalty": 1.0,
+                "length_penalty": 1.0,
+                "no_repeat_ngram_size": 0,
+                "encoder_no_repeat_ngram_size": 0,
+                "bad_words_ids": null,
+                "num_return_sequences": 1,
+                "output_scores": false,
+                "return_dict_in_generate": false,
+                "forced_bos_token_id": null,
+                "forced_eos_token_id": null,
+                "remove_invalid_values": false,
+                "exponential_decay_length_penalty": null,
+                "suppress_tokens": null,
+                "begin_suppress_tokens": null,
+                "num_beam_groups": 1,
+                "diversity_penalty": 0.0,
+                "_name_or_path": "",
+                "transformers_version": "4.57.6",
+                "tf_legacy_loss": false,
+                "use_bfloat16": false,
+                "image_size": 224,
+                "patch_size": 16,
+                "num_channels": 3,
+                "hidden_size": 384,
+                "intermediate_size": 1536,
+                "num_hidden_layers": 12,
+                "num_attention_heads": 6,
+                "hidden_act": "gelu",
+                "attention_dropout": 0.0,
+                "initializer_range": 0.02,
+                "layer_norm_eps": 1e-05,
+                "layerscale_value": 1.0,
+                "drop_path_rate": 0.0,
+                "use_gated_mlp": false,
+                "rope_theta": 100.0,
+                "query_bias": true,
+                "key_bias": false,
+                "value_bias": true,
+                "proj_bias": true,
+                "mlp_bias": true,
+                "num_register_tokens": 4,
+                "pos_embed_shift": null,
+                "pos_embed_jitter": null,
+                "pos_embed_rescale": 2.0,
+                "model_type": "dinov3_vit",
+                "output_attentions": false
+              },
+              "processor_config": {
+                "_processor_class": null,
+                "size": {
+                  "height": 224,
+                  "width": 224
+                },
+                "crop_size": null,
+                "pad_size": null,
+                "do_resize": true,
+                "default_to_square": true,
+                "resample": 2,
+                "do_center_crop": null,
+                "do_rescale": true,
+                "rescale_factor": 0.00392156862745098,
+                "do_normalize": true,
+                "image_mean": [
+                  0.485,
+                  0.456,
+                  0.406
+                ],
+                "image_std": [
+                  0.229,
+                  0.224,
+                  0.225
+                ],
+                "do_pad": null,
+                "do_convert_rgb": null,
+                "return_tensors": null,
+                "data_format": "channels_first",
+                "input_data_format": null,
+                "device": null,
+                "disable_grouping": null,
+                "image_processor_type": "DINOv3ViTImageProcessorFast"
+              },
+              "revision": null,
+              "weight_sha256": null,
+              "rgb_range": "uint8",
+              "image_size": 224,
+              "geometry": "square_resize",
+              "interpolation": "bicubic",
+              "antialias": true,
+              "brightness": 0.1,
+              "contrast": 0.1
+            }
+          },
+          "tokenizer_config": {
+            "_target_": "oat.tokenizer.oat.tokenizer_so3_aug.OATTokSO3Aug",
+            "action_aug": {
+              "_target_": "oat.tokenizer.oat.augment.so3_action_chunk_aug.SO3ActionChunkAug",
+              "p": 0.6,
+              "max_angle_deg": 30.0,
+              "mode": "conjugate",
+              "augment_position": true,
+              "pos_start": 0,
+              "pos_end": 3,
+              "rot_start": 3,
+              "rot_end": 6
+            },
+            "encoder": {
+              "_target_": "oat.tokenizer.oat.encoder.register_encoder.RegisterEncoder",
+              "sample_dim": 7,
+              "sample_horizon": 16,
+              "emb_dim": 256,
+              "head_dim": 64,
+              "depth": 2,
+              "pdropout": 0.1,
+              "latent_dim": 5,
+              "num_registers": 8
+            },
+            "decoder": {
+              "_target_": "oat.tokenizer.oat.decoder.single_pass_decoder.SinglePassDecoder",
+              "sample_dim": 7,
+              "sample_horizon": 16,
+              "emb_dim": 256,
+              "head_dim": 64,
+              "depth": 4,
+              "pdropout": 0.1,
+              "token_dropout_mode": "pow2",
+              "latent_dim": 5,
+              "latent_horizon": 8,
+              "use_causal_decoder": true
+            },
+            "quantizer": {
+              "_target_": "oat.tokenizer.oat.quantizer.fsq.FSQ",
+              "levels": [
+                8,
+                5,
+                5,
+                5,
+                5
+              ]
+            }
+          },
+          "tokenizer_metadata": {
+            "source": "/workspace/ysk/past2next_bug_fixed/output/training/nut_washer_v3_N77_gated_so3aug_20260924_081008_317043427/tokenizer/checkpoints/ep-1540_mse-0.000.ckpt",
+            "sha256": "3ed93e731c35355194f7ab01a3c5c7cbd8a86cbb16b911d36a393d2f12f1e946",
+            "weights": "ema"
+          }
+        },
+        "initialization": "AR normal(0,.02), residual outputs .02/sqrt(3*depth)",
+        "source_sha256": {
+          "oat/policy/p2n_new_common.py": "6070d6101a4e1f39a8f315601832e749fd4d05a7b2b56f9a115a9ec80fa700fc",
+          "oat/policy/p2n_new.py": "91031466c4f65ff67b648c000e0276d141d68ab5da39904fc457e9c0a054a68d",
+          "oat/policy/p2n_state_gate_new.py": "fc463d7703ccf495e3c726e3b5a87287231bbed00a78f2cb14a41786bf5953ea",
+          "oat/model/autoregressive/modern_transformer_cache.py": "5a3c8347a7adaca8e1537cd8f1c86d2aa304205ae525f196e57a9e1b10d3ad72",
+          "oat/model/common/context_batch.py": "231db4bc69c7b34dc67afcca5cca6e467ef42785279eb5f13e4248e04e7bce3b",
+          "oat/perception/token_obs_encoder.py": "e3de6f4e681e4fbe4c85d0c7ebdeddc02a77c9ca336a776d570f6990e925c8f0",
+          "oat/perception/dinov3_patch_encoder.py": "4d786e2766141a43d04235631f77fa51a72ac9801fb3e17d36da49f07217bd28",
+          "oat/perception/visual_resampler.py": "df79bff91e0d424910b40df42feca1dc2e904545af4d93fb65c854503d13316a"
+        }
+      },
+      "dataset": {
+        "path": "/workspace/ysk/zarr/nut_washer_v3_N77.zarr",
+        "train_windows": 93980,
+        "validation_windows": 5269,
+        "train_episode_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          59,
+          60,
+          61,
+          62,
+          63,
+          64,
+          65,
+          66,
+          67,
+          68,
+          69,
+          70,
+          71,
+          72,
+          73,
+          74,
+          75,
+          76
+        ],
+        "validation_episode_ids": [
+          6,
+          33,
+          49,
+          58
+        ],
+        "normalizer_source": "actual_training_episode_mask",
+        "preflight": {
+          "schema_version": 1,
+          "data_path": "/workspace/ysk/zarr/nut_washer_v3_N77.zarr",
+          "val_ratio": 0.05,
+          "seed": 42,
+          "train_episode_ids": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47,
+            48,
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            59,
+            60,
+            61,
+            62,
+            63,
+            64,
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71,
+            72,
+            73,
+            74,
+            75,
+            76
+          ],
+          "validation_episode_ids": [
+            6,
+            33,
+            49,
+            58
+          ],
+          "train": {
+            "episodes": 73,
+            "windows": 93980
+          },
+          "validation": {
+            "episodes": 4,
+            "windows": 5269
+          },
+          "offline_validation_enabled": true
+        }
+      },
+      "component_parameters": {
+        "action_tokenizer": {
+          "total": 5804854,
+          "trainable": 0
+        },
+        "obs_encoder": {
+          "total": 40855424,
+          "trainable": 19258880
+        },
+        "action_normalizer": {
+          "total": 144,
+          "trainable": 0
+        },
+        "raw_proj": {
+          "total": 6144,
+          "trainable": 6144
+        },
+        "acc_proj": {
+          "total": 6144,
+          "trainable": 6144
+        },
+        "jerk_proj": {
+          "total": 6144,
+          "trainable": 6144
+        },
+        "model": {
+          "total": 154883584,
+          "trainable": 154883584
+        },
+        "history_encoder": {
+          "total": 567680,
+          "trainable": 567680
+        },
+        "observation_pool": {
+          "total": 1183488,
+          "trainable": 1183488
+        },
+        "history_gate": {
+          "total": 200067,
+          "trainable": 200067
+        }
+      },
+      "module_tree": [
+        "action_tokenizer",
+        "obs_encoder",
+        "action_normalizer",
+        "raw_proj",
+        "acc_proj",
+        "jerk_proj",
+        "model",
+        "history_encoder",
+        "observation_pool",
+        "history_gate"
+      ],
+      "limitation": "DINO architecture only: no approved pretrained DINO weights loaded, no forward/training/GPU acceptance performed."
+    }
+  ]
+}

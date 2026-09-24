@@ -13,8 +13,10 @@ Options (command-line values override environment settings):
   --dataset PATH          Real-robot Zarr dataset
   --policy-config NAME    Hydra Past2Next policy config (default: train_past2next_scratch_all500)
   --gpus IDS              Physical GPU indices, comma-separated
-  --output-dir PATH       Fresh output directory, or existing run with --policy-only
+  --output-dir PATH       Fresh output directory, or existing tokenizer run with --policy-only
+  --policy-output-dir PATH  Separate fresh policy output directory (default: OUTPUT_DIR/policy)
   --policy-only           Start policy from a completed run's best tokenizer
+  --allow-incomplete-tokenizer  With --policy-only, use the best saved tokenizer so far
   --dry-run               Validate data and print resolved stage configs
   -h, --help              Show this help
 
@@ -53,6 +55,8 @@ and no existing policy output. It inherits the saved tokenizer config and
 dataset unless explicitly provided, selects by full-precision held-out MSE,
 and preserves the original launcher and command records. Combine it with
 --dry-run to validate recovery and resolve only the policy config.
+Add --allow-incomplete-tokenizer when you intentionally stopped Stage 1 early;
+a retained checkpoint with finite held-out reconstruction MSE is still required.
 HELP
 }
 
@@ -74,10 +78,12 @@ TOKENIZER_EPOCHS="${TOKENIZER_EPOCHS:-3001}"
 POLICY_EPOCHS="${POLICY_EPOCHS:-}"
 DRY_RUN=false
 POLICY_ONLY=false
+ALLOW_INCOMPLETE_TOKENIZER=false
+POLICY_OUTPUT_DIR=""
 while (( $# )); do
   option=${1%%=*}
   case "$option" in
-    --tokenizer-config|--dataset|--policy-config|--gpus|--output-dir)
+    --tokenizer-config|--dataset|--policy-config|--gpus|--output-dir|--policy-output-dir)
       if [[ "$1" == *=* ]]; then
         value=${1#*=}
         shift
@@ -93,17 +99,23 @@ while (( $# )); do
         --policy-config) POLICY_CONFIG=$value ;;
         --gpus) TRAIN_GPUS=$value ;;
         --output-dir) RUN_DIR=$value ;;
+        --policy-output-dir) POLICY_OUTPUT_DIR=$value ;;
       esac ;;
     --dry-run) [[ "$1" == --dry-run ]] || fail "Unexpected value for --dry-run"; DRY_RUN=true; shift ;;
     --policy-only) [[ "$1" == --policy-only ]] || fail "Unexpected value for --policy-only"; POLICY_ONLY=true; shift ;;
+    --allow-incomplete-tokenizer) [[ "$1" == --allow-incomplete-tokenizer ]] || fail "Unexpected value for --allow-incomplete-tokenizer"; ALLOW_INCOMPLETE_TOKENIZER=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown argument: $1 (see --help)" ;;
   esac
 done
 
+[[ "$ALLOW_INCOMPLETE_TOKENIZER" == false || "$POLICY_ONLY" == true ]] || fail "--allow-incomplete-tokenizer requires --policy-only"
 DATASET_PATH=$(realpath -m -- "$DATASET_PATH")
 if [[ -n "${RUN_DIR:-}" ]]; then
   RUN_DIR=$(realpath -m -- "$RUN_DIR")
+fi
+if [[ -n "$POLICY_OUTPUT_DIR" ]]; then
+  POLICY_OUTPUT_DIR=$(realpath -m -- "$POLICY_OUTPUT_DIR")
 fi
 cd -- "$(dirname -- "$SCRIPT_PATH")"
 TOKENIZER_CONFIG=${TOKENIZER_CONFIG%.yaml}
@@ -111,12 +123,13 @@ POLICY_CONFIG=${POLICY_CONFIG%.yaml}
 if [[ "$POLICY_ONLY" == true ]]; then
   [[ -n "${RUN_DIR:-}" ]] || fail '--policy-only requires --output-dir or RUN_DIR'
   [[ -d "$RUN_DIR" ]] || fail "Existing run directory not found: $RUN_DIR"
-  [[ ! -e "$RUN_DIR/policy" && ! -L "$RUN_DIR/policy" ]] || fail "Refusing existing policy output: $RUN_DIR/policy"
+  POLICY_OUTPUT_DIR=${POLICY_OUTPUT_DIR:-$RUN_DIR/policy}
+  [[ ! -e "$POLICY_OUTPUT_DIR" && ! -L "$POLICY_OUTPUT_DIR" ]] || fail "Refusing existing policy output: $POLICY_OUTPUT_DIR"
   # Defaults must not silently pair an existing tokenizer with a different
   # dataset or augmentation recipe. Read saved settings before validating data.
   RECOVERY_SETTINGS=$("$TRAIN_PY" - "$RUN_DIR" "$DATASET_PATH" "$TOKENIZER_CONFIG" \
     "${DATASET_PATH_EXPLICIT:-false}" "${TOKENIZER_CONFIG_EXPLICIT:-false}" \
-    "$VAL_RATIO" "${VAL_RATIO_EXPLICIT:-false}" <<'PY'
+    "$VAL_RATIO" "${VAL_RATIO_EXPLICIT:-false}" "$ALLOW_INCOMPLETE_TOKENIZER" <<'PY'
 import json
 import math
 import sys
@@ -136,29 +149,39 @@ if sys.argv[5] == 'true' and sys.argv[3] != config_name:
 saved_val_ratio = float(cfg.task.tokenizer.dataset.val_ratio)
 if sys.argv[7] == 'true' and float(sys.argv[6]) != saved_val_ratio:
     raise ValueError(f'VAL_RATIO must match the saved tokenizer split: {saved_val_ratio}')
-last = None
-with (stage / 'logs.json').open() as stream:
-    for line in stream:
-        if line.strip():
-            last = json.loads(line)
-final_epoch = int(cfg.training.num_epochs) - 1
-if last is None or last.get('epoch') != final_epoch:
-    raise ValueError(f'Tokenizer is incomplete: expected final epoch {final_epoch}')
-# Scheduled validation/reconstruction appear only in the completed epoch record,
-# never in intermediate minibatch records from that same epoch.
-for cadence, metric in [('val_every', 'val_loss'), ('sample_every', 'test_reconst_mse')]:
-    if final_epoch % int(cfg.training[cadence]) == 0:
-        if metric not in last or not math.isfinite(last[metric]):
-            raise ValueError(f'Tokenizer final epoch is missing finite {metric}')
-if not (run / 'tokenizer_completed.json').is_file() and all(
-        final_epoch % int(cfg.training[cadence]) != 0
-        for cadence in ('val_every', 'sample_every')):
-    raise ValueError('Cannot verify tokenizer completion without an epoch-end metric or completion marker')
+if sys.argv[8] == 'true':
+    from scripts.train_real_robot import best_tokenizer_checkpoint
+    import zipfile
+    checkpoint, mse = best_tokenizer_checkpoint(stage)
+    with zipfile.ZipFile(checkpoint) as archive:
+        if not archive.namelist():
+            raise ValueError(f'Empty tokenizer checkpoint: {checkpoint}')
+    print(f'Using best available tokenizer: {checkpoint} (MSE={mse:.17g})', file=sys.stderr)
+else:
+    last = None
+    with (stage / 'logs.json').open() as stream:
+        for line in stream:
+            if line.strip():
+                last = json.loads(line)
+    final_epoch = int(cfg.training.num_epochs) - 1
+    if last is None or last.get('epoch') != final_epoch:
+        raise ValueError(f'Tokenizer is incomplete: expected final epoch {final_epoch}')
+    # Scheduled validation/reconstruction appear only in the completed epoch record,
+    # never in intermediate minibatch records from that same epoch.
+    for cadence, metric in [('val_every', 'val_loss'), ('sample_every', 'test_reconst_mse')]:
+        if final_epoch % int(cfg.training[cadence]) == 0:
+            if metric not in last or not math.isfinite(last[metric]):
+                raise ValueError(f'Tokenizer final epoch is missing finite {metric}')
+    if not (run / 'tokenizer_completed.json').is_file() and all(
+            final_epoch % int(cfg.training[cadence]) != 0
+            for cadence in ('val_every', 'sample_every')):
+        raise ValueError('Cannot verify tokenizer completion without an epoch-end metric or completion marker')
 print(dataset)
 print(config_name)
 print(cfg.training.num_epochs)
 print(saved_val_ratio)
-print(f'Completed tokenizer: epoch {final_epoch}; dataset {dataset}', file=sys.stderr)
+if sys.argv[8] != 'true':
+    print(f'Completed tokenizer: epoch {final_epoch}; dataset {dataset}', file=sys.stderr)
 PY
   )
   mapfile -t RECOVERY_SETTINGS <<< "$RECOVERY_SETTINGS"
@@ -249,6 +272,7 @@ PY
 DATASET_NAME=$(basename -- "$DATASET_PATH" .zarr)
 RUN_GROUP="${DATASET_NAME}_current"
 RUN=$(realpath -m -- "${RUN_DIR:-$PWD/output/${RUN_GROUP}_$(date -u +%Y%m%d_%H%M%S)}")
+POLICY_OUTPUT_DIR=${POLICY_OUTPUT_DIR:-$RUN/policy}
 COMMON=(
   seed=42
   "training.num_demo=$NUM_DEMOS"
@@ -290,7 +314,7 @@ POLICY_ARGS=(
   training.init_checkpoint=null
   ++training.offline_validation_enabled=true
   ++training.offline_validation_reason=held_out_real_robot_episodes
-  "hydra.run.dir=$(hydra_string "$RUN/policy")"
+  "hydra.run.dir=$(hydra_string "$POLICY_OUTPUT_DIR")"
 )
 # The gate config owns its batch, checkpoint cadence, and validation-loss metric.
 # Keep the existing recipe for the original Past2Next policy choices.
@@ -333,7 +357,7 @@ if [[ "$POLICY_ONLY" == false ]]; then
 fi
 exec {RUN_LOCK_FD}> "$RUN/.training.lock"
 flock -n "$RUN_LOCK_FD" || fail "Training already holds the run lock: $RUN"
-[[ ! -e "$RUN/policy" && ! -L "$RUN/policy" ]] || fail "Refusing existing policy output: $RUN/policy"
+[[ ! -e "$POLICY_OUTPUT_DIR" && ! -L "$POLICY_OUTPUT_DIR" ]] || fail "Refusing existing policy output: $POLICY_OUTPUT_DIR"
 LAUNCH_RECORD_DIR=$RUN
 if [[ "$POLICY_ONLY" == true ]]; then
   LAUNCH_RECORD_DIR=$(mktemp -d "$RUN/policy_recovery.XXXXXXXX")
@@ -355,13 +379,13 @@ printf 'Dataset: %s (%s episodes)\n' "$DATASET_PATH" "$NUM_DEMOS"
 printf 'Configs: tokenizer=%s; policy=%s\n' "$TOKENIZER_CONFIG" "$POLICY_CONFIG"
 printf 'GPUs: %s; tokenizer/policy epochs: %s/%s; W&B: %s\n' \
   "$CUDA_VISIBLE_DEVICES" "$TOKENIZER_EPOCHS" "${POLICY_EPOCHS:-policy config default}" "$WANDB_MODE"
-printf 'Images: 128x128; output: %s\n' "$RUN"
+printf 'Images: 128x128; tokenizer run: %s; policy output: %s\n' "$RUN" "$POLICY_OUTPUT_DIR"
 
 if [[ "$POLICY_ONLY" == false ]]; then
   "${TOKENIZER_COMMAND[@]}"
   printf '{"num_epochs": %s}\n' "$TOKENIZER_EPOCHS" > "$RUN/tokenizer_completed.json"
 else
-  printf 'Policy-only recovery: using the completed tokenizer; records: %s\n' "$LAUNCH_RECORD_DIR"
+  printf 'Policy-only recovery: using the best saved tokenizer; records: %s\n' "$LAUNCH_RECORD_DIR"
 fi
 
 # Select using full-precision logged MSE and freeze the best tokenizer.
@@ -422,7 +446,7 @@ PY
 "${POLICY_COMMAND[@]}"
 
 # Reload the selected policy and verify its frozen tokenizer and finite actions.
-"$TRAIN_PY" - "$RUN" <<'PY'
+"$TRAIN_PY" - "$RUN" "$POLICY_OUTPUT_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -431,10 +455,11 @@ from scripts.train_real_robot import best_policy_checkpoint
 from scripts.check_real_robot_checkpoint import check_checkpoint
 
 run = Path(sys.argv[1])
-policy_cfg = OmegaConf.load(run / 'policy/.hydra/config.yaml')
+policy_output = Path(sys.argv[2])
+policy_cfg = OmegaConf.load(policy_output / '.hydra/config.yaml')
 metric_name = policy_cfg.checkpoint.topk.monitor_key
 checkpoint, metric = best_policy_checkpoint(
-    run / 'policy', metric_name=metric_name,
+    policy_output, metric_name=metric_name,
     filename=policy_cfg.checkpoint.topk.format_str,
 )
 report = check_checkpoint(checkpoint, 'cuda:0')
@@ -442,6 +467,7 @@ report['held_out_metric'] = {'name': metric_name, 'value': metric}
 if metric_name == 'test_reconst_mse':
     report['held_out_action_mse'] = metric
 (run / 'checkpoint_check.json').write_text(json.dumps(report, indent=2) + '\n')
+(policy_output / 'checkpoint_check.json').write_text(json.dumps(report, indent=2) + '\n')
 print(json.dumps(report, indent=2), flush=True)
 PY
 }

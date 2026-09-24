@@ -1,0 +1,28 @@
+{
+  "repository": "https://github.com/geyan21/ManiFlow_Policy",
+  "commit": "ef2f116f1f90163ed36e657b8c5503740bb468af",
+  "consulted_on": "2026-09-24",
+  "relationship": "ManiFlow-inspired; OAT code-space, full EMA conditioner, history and norm/FFN adaptations follow local plan",
+  "files": {
+    "model/common/sample_util.py": {
+      "url": "https://raw.githubusercontent.com/geyan21/ManiFlow_Policy/ef2f116f1f90163ed36e657b8c5503740bb468af/ManiFlow/maniflow/model/common/sample_util.py",
+      "sha256": "68f5b88900d8616b87ae8ccd62d8ea7b1cdd50bdc7a3628aa389fcb01ac668dd"
+    },
+    "model/diffusion/ditx.py": {
+      "url": "https://raw.githubusercontent.com/geyan21/ManiFlow_Policy/ef2f116f1f90163ed36e657b8c5503740bb468af/ManiFlow/maniflow/model/diffusion/ditx.py",
+      "sha256": "43ea8d5e4ddf07db147710261b3593808b8e3c0a6d3a0a56966512e94270d1e9"
+    },
+    "model/diffusion/ditx_block.py": {
+      "url": "https://raw.githubusercontent.com/geyan21/ManiFlow_Policy/ef2f116f1f90163ed36e657b8c5503740bb468af/ManiFlow/maniflow/model/diffusion/ditx_block.py",
+      "sha256": "563d6bb927d0f2a1b82bcda95ae9ffb2b2dba0d66bded5f832d8b00ce69721b6"
+    },
+    "policy/maniflow_image_policy.py": {
+      "url": "https://raw.githubusercontent.com/geyan21/ManiFlow_Policy/ef2f116f1f90163ed36e657b8c5503740bb468af/ManiFlow/maniflow/policy/maniflow_image_policy.py",
+      "sha256": "fe21cda24b9382d65eedbdf43c41bb5dd76bce2420dc65855dde57000f8d8c24"
+    },
+    "model/diffusion/ema_model.py": {
+      "url": "https://raw.githubusercontent.com/geyan21/ManiFlow_Policy/ef2f116f1f90163ed36e657b8c5503740bb468af/ManiFlow/maniflow/model/diffusion/ema_model.py",
+      "sha256": "f683be124722abe0703e2cf003566ab2d446783383cdcd5202063e20148ae467"
+    }
+  }
+}

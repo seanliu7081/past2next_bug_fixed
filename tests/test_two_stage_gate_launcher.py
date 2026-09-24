@@ -102,7 +102,7 @@ def test_gate_dry_run_preserves_recipe_and_uses_new_frozen_tokenizer(
     assert policy["policy"]["history_gate_mode"] == "learned"
     assert policy["policy"]["rotation_6d_layout"] == "rows"
     assert policy["training"]["num_epochs"] == (2001 if policy_epochs is None else policy_epochs)
-    assert policy["training"]["checkpoint_every"] == 100
+    assert policy["training"]["checkpoint_every"] == 50
     assert policy["dataloader"]["batch_size"] == policy["val_dataloader"]["batch_size"] == 32
     assert policy["checkpoint"]["topk"] == {
         "monitor_key": "val_loss", "mode": "min", "k": 0, "format_str": VAL_FILENAME,
