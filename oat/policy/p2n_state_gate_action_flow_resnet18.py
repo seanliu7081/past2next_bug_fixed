@@ -1,4 +1,4 @@
-"""DINOv3 policy with measured state/action summaries and a summary-only gate."""
+"""Trainable ResNet18 policy with measured state/action summaries and a summary-only gate."""
 from __future__ import annotations
 
 import math
@@ -8,14 +8,14 @@ from torch import nn
 from torch.nn import functional as F
 
 from oat.model.common.context_batch import Segment
-from oat.model.common.latent_flow_context import FlowContextBatch
+from oat.model.common.action_flow_context import ActionFlowContextBatch
 from oat.model.state_action_history import StateActionHistoryEncoder
-from oat.policy.p2n_latent_flow_common import P2NLatentFlowCommonPolicy, bool_mask
-from oat.policy.past2next_state_history_gate_real_robot import Rotation6DStateActionHistoryEncoder
+from oat.policy.p2n_action_flow_resnet_common import P2NActionFlowResNetCommonPolicy, bool_mask
+from oat.model.action_flow_state_history import Rotation6DStateActionHistoryEncoder
 
 
-class P2NStateGateLatentFlowPolicy(P2NLatentFlowCommonPolicy):
-    VARIANT = 'p2n_state_gate_latent_flow'
+class P2NStateGateActionFlowResNet18Policy(P2NActionFlowResNetCommonPolicy):
+    VARIANT = 'p2n_state_gate_action_flow'
     requires_state_history = True
     supports_history_summary_gate = True
 
@@ -90,7 +90,7 @@ class P2NStateGateLatentFlowPolicy(P2NLatentFlowCommonPolicy):
             rotation_6d_layout=rotation_6d_layout,
         ))
 
-    def build_context(self, obs, past_actions, past_action_valid, frozen_patches=None, prepared_visual=None):
+    def build_context(self, obs, past_actions, past_action_valid, prepared_visual=None):
         required = ['state_history__' + key for key in self.state_history_keys] + ['state_history_valid']
         missing = [key for key in required if key not in obs]
         if missing:
@@ -102,7 +102,7 @@ class P2NStateGateLatentFlowPolicy(P2NLatentFlowCommonPolicy):
         transition_valid = state_valid[:, :-1] & state_valid[:, 1:]
         if not torch.equal(valid, transition_valid):
             raise ValueError('past_action_valid must match aligned adjacent-state transitions')
-        base = super().build_context(obs, past_actions, valid, frozen_patches, prepared_visual)
+        base = super().build_context(obs, past_actions, valid, prepared_visual)
         summaries = self.history_encoder(
             {key: obs['state_history__' + key] for key in self.state_history_keys},
             state_valid, past, self.action_normalizer,
@@ -124,7 +124,7 @@ class P2NStateGateLatentFlowPolicy(P2NLatentFlowCommonPolicy):
         # The current measured state is valid even when no preceding transition exists.
         # The history encoder always executes, preserving its DDP graph at episode start.
         summary_valid = state_valid[:, -1:].expand(-1, self.history_summary_tokens)
-        return FlowContextBatch(
+        return ActionFlowContextBatch(
             memory=torch.cat((base.memory, summaries), dim=1),
             valid_mask=torch.cat((base.valid_mask, summary_valid), dim=1),
             segment_ids=torch.cat((base.segment_ids, base.segment_ids.new_full(

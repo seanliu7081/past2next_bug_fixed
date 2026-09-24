@@ -33,8 +33,8 @@ action_schema:
 training:
   num_demo: 77
   num_epochs: 2001
-  checkpoint_every: 50
-  snapshot_every: 50
+  checkpoint_every: 20
+  snapshot_every: 20
   offline_validation_reason: held_out_nut_washer_v3_N77_episodes
 
 task:

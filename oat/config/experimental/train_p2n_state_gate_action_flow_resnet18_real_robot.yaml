@@ -1,10 +1,10 @@
 # @package _global_
 defaults:
-  - /train_p2n_state_gate_action_flow
+  - /train_p2n_state_gate_action_flow_resnet18
   - override /task/policy: real_robot/nut_washer_with_prev_window
   - _self_
 
-name: train_p2n_state_gate_action_flow_real_robot
+name: train_p2n_state_gate_action_flow_resnet18_real_robot
 task_type: real_robot
 state_history_keys: [robot0_eef_pos, robot0_eef_rot6d, robot0_gripper_qpos]
 
@@ -58,4 +58,4 @@ task:
       return_history_validity: true
 
 logging:
-  project: real_robot_p2n_action_flow
+  project: real_robot_p2n_action_flow_resnet18

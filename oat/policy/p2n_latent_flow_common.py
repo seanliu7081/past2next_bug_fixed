@@ -5,7 +5,9 @@ existing tested helpers. All flow-specific paths live in new files.
 """
 from __future__ import annotations
 import copy
+import contextlib
 import importlib.metadata
+from numbers import Integral
 from pathlib import Path
 import dill
 import hydra
@@ -61,6 +63,7 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
         n_action_steps=8, n_obs_steps=2, past_n=7, horizon=16,
         embed_dim=768, n_layers=16, n_heads=12, ffn_dim=2048, dropout=0.0,
         variant=None, task='libero', flow=None,
+        obs_encoder_type='dinov3', resnet_config=None,
         initialization='xavier_uniform_slot_normal_0.02',
         construction_mode='fresh', dino_path=None, dino_revision=None,
         dino_config=None, processor_config=None, tokenizer_checkpoint=None,
@@ -76,6 +79,14 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
             raise ValueError("Flow consistency training requires dropout=0.0")
         if initialization != 'xavier_uniform_slot_normal_0.02':
             raise ValueError('Unsupported flow initialization')
+        if obs_encoder_type not in ('dinov3', 'resnet18'):
+            raise ValueError('obs_encoder_type must be dinov3 or resnet18')
+        if obs_encoder_type == 'dinov3' and resnet_config is not None:
+            raise ValueError('ResNet configuration cannot be used with DINO')
+        if obs_encoder_type == 'resnet18' and any(value is not None for value in
+                (dino_path, dino_revision, dino_config, processor_config)):
+            raise ValueError('ResNet flow does not use DINO sources or preprocessing')
+        self.obs_encoder_type = obs_encoder_type
         self.flow = validate_flow_config(flow)
         if variant is not None and variant != self.VARIANT:
             raise ValueError(f'{type(self).__name__} requires variant={self.VARIANT!r}')
@@ -130,33 +141,47 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
         if decoder.sample_dim != self.action_dim or decoder.sample_horizon != self.horizon:
             raise ValueError('Tokenizer action dimension/horizon does not match the task schema')
         self.max_seq_len = int(action_tokenizer.latent_horizon)
-        if obs_encoder is None:
-            if obs_encoder_config is not None:
-                enc_cfg = _plain(obs_encoder_config)
-                enc_cfg.pop('_target_', None)
-                if construction_mode == 'restore':
-                    enc_cfg['dino']['load_mode'] = 'restore'
-                    enc_cfg['dino'].pop('pretrained_path', None)
-                obs_encoder = FlowTokenObservationEncoder(**enc_cfg)
-            else:
-                obs_encoder = FlowTokenObservationEncoder(
-                    shape_meta=self.shape_meta, n_obs_steps=n_obs_steps, n_emb=embed_dim,
-                    n_head=n_heads, ffn_dim=ffn_dim, dropout=dropout,
-                    num_queries=num_visual_queries, resampler_depth=resampler_depth,
-                    activation_checkpointing=activation_checkpointing,
-                    dino=dict(pretrained_path=dino_path, load_mode=construction_mode,
-                              config=_plain(dino_config), processor_config=_plain(processor_config),
-                              revision=dino_revision, rgb_range=rgb_range,
-                              brightness=image_brightness, contrast=image_contrast),
-                )
+        if obs_encoder_type == 'resnet18':
+            from oat.perception.latent_flow_resnet_obs_encoder import FlowResNetObservationEncoder
+            encoder_class = FlowResNetObservationEncoder
+            if obs_encoder is None:
+                if obs_encoder_config is not None:
+                    enc_cfg = _plain(obs_encoder_config)
+                    enc_cfg.pop('_target_', None)
+                    obs_encoder = FlowResNetObservationEncoder(**enc_cfg)
+                else:
+                    obs_encoder = FlowResNetObservationEncoder(
+                        shape_meta=self.shape_meta, n_obs_steps=n_obs_steps, n_emb=embed_dim,
+                        **(_plain(resnet_config) or {}))
+        else:
+            encoder_class = FlowTokenObservationEncoder
+            if obs_encoder is None:
+                if obs_encoder_config is not None:
+                    enc_cfg = _plain(obs_encoder_config)
+                    enc_cfg.pop('_target_', None)
+                    if construction_mode == 'restore':
+                        enc_cfg['dino']['load_mode'] = 'restore'
+                        enc_cfg['dino'].pop('pretrained_path', None)
+                    obs_encoder = FlowTokenObservationEncoder(**enc_cfg)
+                else:
+                    obs_encoder = FlowTokenObservationEncoder(
+                        shape_meta=self.shape_meta, n_obs_steps=n_obs_steps, n_emb=embed_dim,
+                        n_head=n_heads, ffn_dim=ffn_dim, dropout=dropout,
+                        num_queries=num_visual_queries, resampler_depth=resampler_depth,
+                        activation_checkpointing=activation_checkpointing,
+                        dino=dict(pretrained_path=dino_path, load_mode=construction_mode,
+                                  config=_plain(dino_config), processor_config=_plain(processor_config),
+                                  revision=dino_revision, rgb_range=rgb_range,
+                                  brightness=image_brightness, contrast=image_contrast),
+                    )
         if obs_encoder.output_feature_dim() != embed_dim:
             raise ValueError('Observation encoder width must equal action decoder width')
         if obs_encoder.n_obs_steps != self.n_obs_steps:
             raise ValueError('Observation encoder and policy observation windows must match')
         if _plain(obs_encoder.shape_meta) != self.shape_meta:
             raise ValueError('Observation encoder and policy input schemas must match')
-        if not isinstance(obs_encoder, FlowTokenObservationEncoder):
-            raise TypeError('Flow policies require FlowTokenObservationEncoder with frozen-patch inputs')
+        if not isinstance(obs_encoder, encoder_class):
+            raise TypeError(f'obs_encoder must match obs_encoder_type={obs_encoder_type}')
         self.obs_encoder = obs_encoder
         self.modalities = obs_encoder.modalities()
         self.obs_ports = list(obs_encoder.rgb_ports) + list(obs_encoder.state_ports)
@@ -190,8 +215,13 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
         self.register_buffer('_context_schema', torch.tensor(self.CONTEXT_SCHEMA_VERSION))
         self.register_buffer('_variant_code', torch.tensor(int(self.requires_state_history)))
         self.register_buffer('_flow_artifact_schema', torch.tensor(self.ARTIFACT_SCHEMA_VERSION))
+        # Existing DINO state dictionaries remain unchanged and load strictly.
+        # The ResNet-only marker rejects cross-encoder loads before any tensors mutate.
+        if obs_encoder_type == 'resnet18':
+            self.register_buffer('_resnet18_obs_schema', torch.tensor(1))
         self._construction = dict(
             shape_meta=self.shape_meta, variant=self.variant, task=task,
+            obs_encoder_type=obs_encoder_type,
             n_action_steps=n_action_steps, n_obs_steps=n_obs_steps, past_n=past_n, horizon=horizon,
             embed_dim=embed_dim, n_layers=n_layers, n_heads=n_heads, ffn_dim=ffn_dim, dropout=dropout,
             activation_checkpointing=activation_checkpointing, flow=copy.deepcopy(self.flow),
@@ -207,9 +237,60 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
         return self.latent_adapter.tokenizer
 
     def load_state_dict(self, state_dict, strict=True, **kwargs):
+        saved_encoder = 'resnet18' if '_resnet18_obs_schema' in state_dict else 'dinov3'
+        if saved_encoder != self.obs_encoder_type:
+            raise ValueError('Checkpoint observation encoder does not match this policy')
+        if saved_encoder == 'resnet18' and int(state_dict['_resnet18_obs_schema']) != 1:
+            raise ValueError('Unsupported ResNet observation schema')
         if int(state_dict.get('_flow_artifact_schema', -1)) != self.ARTIFACT_SCHEMA_VERSION:
             raise ValueError('Checkpoint is not a compatible oat_latent_flow artifact')
         return super().load_state_dict(state_dict, strict=strict, **kwargs)
+
+    def set_normalizer(self, normalizer):
+        super().set_normalizer(normalizer)
+        if self.obs_encoder_type == 'resnet18':
+            # Policy normalizes current state once; the ResNet adapter owns RGB normalization.
+            self.obs_encoder.set_normalizer(normalizer[0] if isinstance(normalizer, (list, tuple)) else normalizer)
+
+    @contextlib.contextmanager
+    def _rollout_mode(self):
+        modes = [(module, module.training) for module in self.modules()]
+        self.eval()
+        try:
+            yield
+        finally:
+            for module, mode in modes:
+                module.training = mode
+            self.action_tokenizer.eval()
+            if self.obs_encoder_type == 'dinov3':
+                self.obs_encoder.dino_encoder.backbone.eval()
+
+    @torch.no_grad()
+    def prepare_visual_conditioning(self, obs):
+        if self.obs_encoder_type == 'dinov3':
+            return {'frozen_patches': self.obs_encoder.extract_frozen_patches(obs).detach()}
+        return {'prepared_visual': self.obs_encoder.prepare_conditioning(obs).detach()}
+
+    def get_optimizer(self, policy_lr=5e-5, obs_enc_lr=1e-4, weight_decay=0.01, betas=(0.9, 0.95)):
+        # ResNet keeps the original state head inside ProjectionStateEncoder;
+        # parameter identity handles both encoders without renaming checkpoints.
+        state_parameters = {id(value) for value in self.obs_encoder.state_projection.parameters()}
+        groups, seen = {}, set()
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad or id(parameter) in seen:
+                continue
+            seen.add(id(parameter))
+            visual = name.startswith('obs_encoder.') and id(parameter) not in state_parameters
+            lr = obs_enc_lr if visual else policy_lr
+            decay = weight_decay if parameter.ndim >= 2 else 0.
+            groups.setdefault((lr, decay), []).append(parameter)
+        return torch.optim.AdamW([{'params': params, 'lr': lr, 'weight_decay': decay}
+                                  for (lr, decay), params in groups.items()], betas=tuple(betas))
+
+    def get_policy_name(self):
+        if self.obs_encoder_type == 'dinov3':
+            return super().get_policy_name()
+        return f'{self.variant}_resnet18_{self.task}'
 
     def normalized_observation(self, obs):
         normalized = dict(obs)
@@ -222,7 +303,7 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
     def current_state_features(self, obs):
         return self.obs_encoder.state_features(self.normalized_observation(obs)).flatten(1)
 
-    def build_context(self, obs, past_actions, past_action_valid, frozen_patches=None):
+    def build_context(self, obs, past_actions, past_action_valid, frozen_patches=None, prepared_visual=None):
         past, valid = self._safe_past(past_actions, past_action_valid)
         normalized_obs = dict(obs)
         for key in self.obs_encoder.state_ports:
@@ -231,7 +312,14 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
             if not torch.isfinite(obs[key]).all():
                 raise ValueError(f'Current observation {key!r} must be finite')
             normalized_obs[key] = self.action_normalizer[key].normalize(obs[key])
-        visual, proprio = self.obs_encoder(normalized_obs, frozen_patches=frozen_patches)
+        if self.obs_encoder_type == 'dinov3':
+            if prepared_visual is not None:
+                raise ValueError('DINO conditioning requires frozen patches, not prepared ResNet images')
+            visual, proprio = self.obs_encoder(normalized_obs, frozen_patches=frozen_patches)
+        else:
+            if frozen_patches is not None:
+                raise ValueError('ResNet conditioning requires images, not frozen feature tensors')
+            visual, proprio = self.obs_encoder(normalized_obs, prepared_visual=prepared_visual)
         if visual.shape[0] != past.shape[0]:
             raise ValueError('Observation and command-history batch sizes differ')
         raw = self.raw_proj(past) + self.action_time_embedding + self.type_embedding[2]
@@ -260,8 +348,10 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
         if not isinstance(prepared, PreparedFlowBatch):
             raise TypeError('Flow forward requires prepare_flow_training_batch output, including EMA targets')
         prepared.validate()
+        if prepared.obs_encoder_type != self.obs_encoder_type:
+            raise ValueError('Prepared batch observation encoder does not match student')
         context = self.build_context(prepared.obs, prepared.past_actions,
-                                     prepared.past_action_valid, prepared.frozen_patches)
+                                     prepared.past_action_valid, prepared.frozen_patches, prepared.prepared_visual)
         context.validate_variant(self.variant)
         velocity = self.model(prepared.noisy_latents, time=prepared.time,
             step_size=prepared.step_size, context=context,
@@ -277,8 +367,8 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
 
     @torch.no_grad()
     def _generate_latents(self, obs, past, valid, *, num_flow_steps=None, generator=None,
-                          initial_noise=None, frozen_patches=None):
-        context = self.build_context(obs, past, valid, frozen_patches)
+                          initial_noise=None, frozen_patches=None, prepared_visual=None):
+        context = self.build_context(obs, past, valid, frozen_patches, prepared_visual)
         context.validate_variant(self.variant)
         z = euler_sample(self.model, context=context,
             current_state=self.current_state_features(obs),
@@ -287,9 +377,10 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
         return z, self.latent_adapter.snap_codes(z)
 
     @torch.no_grad()
-    def _generate_actions(self, obs, past, valid, *, num_flow_steps=None, generator=None):
+    def _generate_actions(self, obs, past, valid, *, num_flow_steps=None, generator=None,
+                          initial_noise=None):
         _, grid = self._generate_latents(obs, past, valid,
-            num_flow_steps=num_flow_steps, generator=generator)
+            num_flow_steps=num_flow_steps, generator=generator, initial_noise=initial_noise)
         return self.latent_adapter.decode_grid_codes(grid)
 
     @torch.no_grad()
@@ -355,23 +446,93 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
         return {'action': action, 'action_pred': prediction}
 
     @torch.no_grad()
-    def validation_metrics(self, batch, generator, history_mode='expert', compute_decoded=True):
+    def _validation_generated_past(self, batch, past, row_generators):
+        """Generate every valid history in one batch with independent sample noise.
+
+        Training keeps its bounded self-past chunks. Validation is bounded by the
+        validation loader batch instead, including the previous-window forwards.
+        """
+        required = ('prev_obs', 'prev_past_action', 'prev_past_action_valid', 'prev_window_valid')
+        if any(key not in batch for key in required):
+            raise KeyError('Self-past requires previous-window observations and validity metadata')
+        selected = bool_mask(batch['prev_window_valid'].reshape(-1), (past.shape[0],),
+                             'prev_window_valid', past.device)
+        indices = selected.nonzero(as_tuple=True)[0]
+        if indices.numel() == 0:
+            return past.detach()
+        # Match each old batch-one Euler draw after its FM/time/current-Euler draws.
+        # No Bernoulli draw occurs: generated-history validation has probability 1.
+        noise_shape = (1, self.flow['num_slots'], self.flow['code_dim'])
+        initial_noise = torch.cat([
+            torch.randn(noise_shape, device=past.device, dtype=torch.float32,
+                        generator=row_generators[row])
+            for row in indices.tolist()
+        ], dim=0)
+        previous = batch['prev_past_action'][indices]
+        # Exclude invalid previous windows before the gated encoder sees padding.
+        prediction = self._generate_actions(
+            {key: value[indices] for key, value in batch['prev_obs'].items()},
+            previous, batch['prev_past_action_valid'][indices],
+            num_flow_steps=self.flow['self_past_steps'], initial_noise=initial_noise)
+        chunk = torch.cat((previous, prediction[:, :self.n_action_steps]), dim=1)[:, -self.past_n:]
+        generated = past.detach().clone()
+        generated[indices] = chunk.detach().to(past.dtype)
+        valid = bool_mask(batch['past_action_valid'], past.shape[:2], 'past_action_valid', past.device)
+        return torch.where((selected[:, None] & valid)[..., None], generated, past).detach()
+
+    @torch.no_grad()
+    def validation_metrics(self, batch, generator=None, history_mode='expert', compute_decoded=True,
+                           *, sample_seeds=None):
+        """Return metric sums/counts; sample seeds make loader batching reproducible.
+
+        The generator-only API retains its existing batched RNG stream. With
+        sample_seeds, random tensors match independent batch-one evaluations,
+        while all model, observation-encoder and tokenizer calls stay batched.
+        """
         if history_mode not in ('expert','generated'):
             raise ValueError('Validation history must be expert or generated')
         b = len(batch['action'])
+        if b == 0:
+            raise ValueError('Validation requires at least one sample')
         device = batch['action'].device
         shape = (b, self.flow['num_slots'], self.flow['code_dim'])
-        # Draw current-window randomness before optional history generation so both
-        # history evaluations receive identical FM times/noise and Euler noise.
-        fm_noise = torch.randn(shape, device=device, generator=generator, dtype=torch.float32)
-        t = 0.999 * (1 - torch.rand(b, device=device, generator=generator).pow(2 / 3))
-        sampling_noise = torch.randn(shape, device=device, generator=generator, dtype=torch.float32)
+        row_generators = None
+        if sample_seeds is not None:
+            if generator is not None:
+                raise ValueError('Provide either generator or sample_seeds for validation, not both')
+            seeds = list(sample_seeds)
+            if len(seeds) != b:
+                raise ValueError('sample_seeds must contain one integer seed per validation sample')
+            if any(isinstance(seed, bool) or not isinstance(seed, Integral) for seed in seeds):
+                raise ValueError('sample_seeds must contain integer seeds')
+            row_generators = [torch.Generator(device=device).manual_seed(int(seed)) for seed in seeds]
+            row_fm_noise, row_times, row_sampling_noise = [], [], []
+            for row_generator in row_generators:
+                row_shape = (1, self.flow['num_slots'], self.flow['code_dim'])
+                row_fm_noise.append(torch.randn(row_shape, device=device,
+                    generator=row_generator, dtype=torch.float32))
+                row_times.append(0.999 * (1 - torch.rand(1, device=device,
+                    generator=row_generator).pow(2 / 3)))
+                row_sampling_noise.append(torch.randn(row_shape, device=device,
+                    generator=row_generator, dtype=torch.float32))
+            fm_noise = torch.cat(row_fm_noise, dim=0)
+            t = torch.cat(row_times, dim=0)
+            sampling_noise = torch.cat(row_sampling_noise, dim=0)
+        else:
+            # Draw current-window randomness before optional history generation so both
+            # history evaluations receive identical FM times/noise and Euler noise.
+            fm_noise = torch.randn(shape, device=device, generator=generator, dtype=torch.float32)
+            t = 0.999 * (1 - torch.rand(b, device=device, generator=generator).pow(2 / 3))
+            sampling_noise = torch.randn(shape, device=device, generator=generator, dtype=torch.float32)
         with self._rollout_mode(), self._clean_autocast_cache():
             past = batch['past_action']
             if history_mode == 'generated':
-                past = self._maybe_self_past(batch, past, probability=1., generator=generator)
-            patches = self.obs_encoder.extract_frozen_patches(batch['obs'])
-            context = self.build_context(batch['obs'], past, batch['past_action_valid'], patches)
+                if row_generators is None:
+                    past = self._maybe_self_past(batch, past, probability=1., generator=generator)
+                else:
+                    past = self._validation_generated_past(batch, past, row_generators)
+            visual_inputs = self.prepare_visual_conditioning(batch['obs'])
+            context = self.build_context(batch['obs'], past, batch['past_action_valid'], **visual_inputs)
             state = self.current_state_features(batch['obs'])
             target = self.latent_adapter.encode_actions(batch['action']).codes
             velocity = self.model(interpolate_latents(target, fm_noise, t), time=t,
@@ -415,7 +576,7 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
 
     def artifact_metadata(self):
         versions = {}
-        for package in ('torch','torchvision','transformers','accelerate'):
+        for package in ('torch','torchvision','transformers','accelerate','robomimic'):
             try:
                 versions[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
@@ -431,7 +592,14 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
                    directory/'perception/visual_resampler.py', directory/'perception/dinov3_patch_encoder.py',
                    directory/'model/common/latent_flow_context.py', directory/'common/latent_flow_batch.py',
                    directory/'tokenizer/oat/tokenizer.py', directory/'tokenizer/oat/quantizer/fsq.py']
+        if self.obs_encoder_type == 'resnet18':
+            sources.extend([directory/'perception/latent_flow_resnet_obs_encoder.py',
+                            directory/'perception/robomimic_vision_encoder.py',
+                            directory/'perception/state_encoder.py', directory/'perception/crop_randomizer.py'])
         return dict(policy_family=self.policy_family, artifact_schema_version=self.ARTIFACT_SCHEMA_VERSION,
+            obs_encoder_type=self.obs_encoder_type,
+            observation_conditioning=('frozen_dino_patches_shared' if self.obs_encoder_type == 'dinov3'
+                                      else 'shared_normalized_crops_independent_trainable_resnet18'),
             variant=self.variant, task=self.task, task_type=self.task,
             context_schema=self.CONTEXT_SCHEMA_VERSION, shape_meta=copy.deepcopy(self.shape_meta),
             execution_protocol='acknowledged_commands_v1',
@@ -460,6 +628,8 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
         register_new_resolvers()
         cfg = OmegaConf.create(_plain(payload['cfg']))
         config = OmegaConf.create(payload['policy_config'])
+        if metadata.get('obs_encoder_type', 'dinov3') != config.get('obs_encoder_type', 'dinov3'):
+            raise ValueError('Artifact observation encoder metadata and architecture disagree')
         if policy_overrides:
             raise ValueError('Flow artifacts restore their exact architecture; set num_flow_steps in predict_action')
         config.construction_mode = 'restore'
@@ -482,8 +652,8 @@ class P2NLatentFlowCommonPolicy(P2NNewCommonPolicy):
 def prepare_flow_training_batch(batch, *, student, teacher, generator, self_past_generator=None):
     if teacher is student or teacher.training or any(p.requires_grad for p in teacher.parameters()):
         raise ValueError('Consistency requires an independent eval/no-grad full EMA policy')
-    if teacher.variant != student.variant:
-        raise ValueError('Teacher and student variants must match')
+    if teacher.variant != student.variant or teacher.obs_encoder_type != student.obs_encoder_type:
+        raise ValueError('Teacher and student variants and observation encoders must match')
     past = batch['past_action']
     if batch['past_action_valid'].dtype != torch.bool:
         raise ValueError('Training past_action_valid must be bool')
@@ -492,14 +662,15 @@ def prepare_flow_training_batch(batch, *, student, teacher, generator, self_past
         generator=generator if self_past_generator is None else self_past_generator)
     targets = student.latent_adapter.encode_actions(batch['action']).codes
     noise = torch.randn(targets.shape, device=targets.device, dtype=torch.float32, generator=generator)
-    patches = student.obs_encoder.extract_frozen_patches(batch['obs']).detach()
+    visual_inputs = student.prepare_visual_conditioning(batch['obs'])
     zt = interpolate_latents(targets, noise, schedule.time)
     velocity_targets = targets - noise
     ct = schedule.ct_indices
     def teacher_velocity(z_next, time_next, original_dt, selected_rows):
         rows = ct[selected_rows]
         obs = {key: value[rows] for key, value in batch['obs'].items()}
-        context = teacher.build_context(obs, past[rows], batch['past_action_valid'][rows], patches[rows])
+        context = teacher.build_context(obs, past[rows], batch['past_action_valid'][rows],
+            **{key: value[rows] for key, value in visual_inputs.items()})
         context.validate_variant(teacher.variant)
         return teacher.model(z_next, time=time_next, step_size=original_dt,
                              context=context, current_state=teacher.current_state_features(obs)).float()
@@ -508,4 +679,4 @@ def prepare_flow_training_batch(batch, *, student, teacher, generator, self_past
     return PreparedFlowBatch(zt.detach(), schedule.time, schedule.step_size,
         velocity_targets.detach(), schedule.fm_indices, schedule.ct_indices,
         {key: value.detach() for key, value in batch['obs'].items()}, past.detach(),
-        batch['past_action_valid'], patches).validate()
+        batch['past_action_valid'], obs_encoder_type=student.obs_encoder_type, **visual_inputs).validate()

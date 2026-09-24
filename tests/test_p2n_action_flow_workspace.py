@@ -222,7 +222,13 @@ def test_complete_artifact_restores_distinct_ema_optimizer_and_counters(monkeypa
     assert all(torch.equal(expected[name], torch.rand(6, generator=value)) for name, value in restored.generators.items())
 
 
-def test_workspace_flushes_tail_and_advances_only_optimizer_updates(monkeypatch, tmp_path):
+@pytest.mark.parametrize("num_epochs,expected_saves", [
+    (1, [(1, "latest")]),
+    (41, [(20, "latest"), (20, "ep-0020"),
+          (40, "latest"), (40, "ep-0040"), (41, "latest")]),
+])
+def test_workspace_flushes_tail_and_saves_after_completed_epochs(
+        monkeypatch, tmp_path, num_epochs, expected_saves):
     from accelerate import Accelerator
     import oat.workspace.train_p2n_action_flow as module
 
@@ -267,13 +273,13 @@ def test_workspace_flushes_tail_and_advances_only_optimizer_updates(monkeypatch,
     cfg.policy._target_ = "fake.Student"
     cfg.task.policy.dataset._target_ = "fake.Dataset"
     cfg.task.policy.lazy_eval = True
-    cfg.training.update(dict(resume=False, allow_bf16=False, num_epochs=1,
+    cfg.training.update(dict(resume=False, allow_bf16=False, num_epochs=num_epochs,
                              gradient_accumulate_every=2, offline_validation_enabled=False,
-                             max_grad_norm=1., checkpoint_every=100, snapshot_every=0))
+                             max_grad_norm=1., checkpoint_every=20, snapshot_every=20))
     cfg.dataloader = dict(batch_size=4, drop_last=True, num_workers=0, shuffle=False)
     cfg.val_dataloader = dict(batch_size=4, drop_last=False, num_workers=0, shuffle=False)
     cfg.logging = dict(mode="disabled")
-    cfg.checkpoint = dict(save_last_ckpt=False, save_last_snapshot=False)
+    cfg.checkpoint = dict(save_last_ckpt=True, save_last_snapshot=False)
     student = LossStudent()
     original_instantiate = module.hydra.utils.instantiate
 
@@ -288,13 +294,16 @@ def test_workspace_flushes_tail_and_advances_only_optimizer_updates(monkeypatch,
     monkeypatch.setattr(module.hydra.utils, "instantiate", instantiate)
     monkeypatch.setattr(module, "Accelerator", lambda **kwargs: Accelerator(cpu=True, **kwargs))
     workspace = TrainP2NActionFlowWorkspace(cfg, output_dir=str(tmp_path))
+    saved = []
+    monkeypatch.setattr(workspace, "save_checkpoint", lambda *, tag: saved.append((workspace.epoch, tag)))
     workspace.run()
-    assert workspace.global_step == 3
-    assert workspace.completed_optimizer_steps == 2
-    assert workspace.ema_state["optimization_step"] == 2
-    assert workspace.model.self_past_step == workspace.ema_model.self_past_step == 2
-    assert workspace.lr_scheduler_state["last_epoch"] == 2
-    assert workspace.epoch == 1
+    assert workspace.global_step == 3 * num_epochs
+    assert workspace.completed_optimizer_steps == 2 * num_epochs
+    assert workspace.ema_state["optimization_step"] == 2 * num_epochs
+    assert workspace.model.self_past_step == workspace.ema_model.self_past_step == 2 * num_epochs
+    assert workspace.lr_scheduler_state["last_epoch"] == 2 * num_epochs
+    assert workspace.epoch == num_epochs
+    assert saved == expected_saves
 
 
 def test_fresh_fit_uses_dataset_training_frames_once_and_records_provenance():

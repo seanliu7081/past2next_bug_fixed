@@ -5,6 +5,9 @@ FLOW_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd -- "$FLOW_ROOT"
 FLOW_PYTHON="${FLOW_PYTHON:-${P2N_FLOW_PYTHON:-/venv/real_robot/bin/python}}"
 FLOW_GPUS="${FLOW_GPUS:-2,3}"
+FLOW_OBS_ENCODER="${FLOW_OBS_ENCODER:-}"
+FLOW_DINO_EXPLICIT=false
+[[ -z "${FLOW_DINO:-}" ]] || FLOW_DINO_EXPLICIT=true
 FLOW_DINO="${FLOW_DINO:-/workspace/.hf_home/hub/models--facebook--dinov3-vits16-pretrain-lvd1689m/snapshots/114c1379950215c8b35dfcd4e90a5c251dde0d32}"
 FLOW_TOKENIZER="${FLOW_TOKENIZER:-}"
 FLOW_OUTPUT_ROOT="${FLOW_OUTPUT_ROOT:-$FLOW_ROOT/output/training}"
@@ -23,12 +26,13 @@ Usage: bash train_p2n_latent_flow.sh [OPTIONS] [-- HYDRA_OVERRIDES...]
 
   --gpus 2,3              Physical GPU indices; checked before training
   --variant VARIANT       both (default), p2n_latent_flow, or p2n_state_gate_latent_flow
+  --obs-encoder ENCODER   dinov3 (fresh default) or resnet18; resume infers saved encoder
   --batch-size N          Training microbatch per GPU: >=4 and divisible by 4 (default 4)
   --val-batch-size N      Validation loader batch per rank (default 4)
   --grad-accum N          Microbatches per optimizer update (default 8)
-  --task TASK             real_robot (default) or libero
+  --task TASK             pen_cabinet, real_robot (nut-washer default), or libero
   --python PATH           Python interpreter (default /venv/real_robot/bin/python)
-  --dino PATH             Local DINO snapshot (defaults to the installed snapshot)
+  --dino PATH             DINO-only local snapshot (defaults to the installed snapshot)
   --dino-revision SHA     Pinned DINO revision override
   --tokenizer PATH        Task-matched OAT checkpoint (real_robot config supplies its default)
   --output PATH           Single variant: exact output path; both: parent for separate run directories
@@ -40,6 +44,8 @@ Usage: bash train_p2n_latent_flow.sh [OPTIONS] [-- HYDRA_OVERRIDES...]
 
 Defaults: both variants run sequentially with online W&B. The real-robot
 configuration uses nut_washer_v3_N77, 2001 epochs and the selected frozen OAT.
+Use --task pen_cabinet for pen_cabinet_N67 and its matching frozen OAT.
+ResNet-18 uses the original trainable observation encoder without a DINO checkpoint.
 Effective batch = batch-size x GPU count x grad-accum.
 Explicit Hydra overrides after -- take precedence over convenience flags.
 HELP
@@ -51,7 +57,7 @@ while (($#)); do
     set -- "${1%%=*}" "${1#*=}" "${@:2}"
   fi
   case "$1" in
-    --gpus|--variant|--task|--python|--dino|--dino-revision|--tokenizer|--output|--resume|--num-processes|--batch-size|--val-batch-size|--grad-accum)
+    --gpus|--variant|--obs-encoder|--task|--python|--dino|--dino-revision|--tokenizer|--output|--resume|--num-processes|--batch-size|--val-batch-size|--grad-accum)
       if (($# < 2)) || [[ -z "$2" || "$2" == --* ]]; then
         echo "$1 requires a value" >&2
         exit 2
@@ -62,9 +68,10 @@ while (($#)); do
       case "$FLOW_FLAG" in
         --gpus) FLOW_GPUS="$FLOW_VALUE" ;;
         --variant) FLOW_SELECTION="$FLOW_VALUE" ;;
+        --obs-encoder) FLOW_OBS_ENCODER="$FLOW_VALUE" ;;
         --task) FLOW_TASK="$FLOW_VALUE" ;;
         --python) FLOW_PYTHON="$FLOW_VALUE" ;;
-        --dino) FLOW_DINO="$FLOW_VALUE" ;;
+        --dino) FLOW_DINO="$FLOW_VALUE"; FLOW_DINO_EXPLICIT=true ;;
         --dino-revision) FLOW_DINO_REVISION="$FLOW_VALUE" ;;
         --tokenizer) FLOW_TOKENIZER="$FLOW_VALUE" ;;
         --output) FLOW_OUTPUT="$FLOW_VALUE" ;;
@@ -99,9 +106,17 @@ while (($#)); do
 done
 
 case "$FLOW_TASK" in
-  real_robot|libero) ;;
+  real_robot|libero|pen_cabinet) ;;
   *) echo "Unknown task: $FLOW_TASK" >&2; exit 2 ;;
 esac
+case "$FLOW_OBS_ENCODER" in
+  ''|dinov3|resnet18) ;;
+  *) echo "Unknown observation encoder: $FLOW_OBS_ENCODER" >&2; exit 2 ;;
+esac
+if [[ "$FLOW_OBS_ENCODER" == resnet18 && ( "$FLOW_DINO_EXPLICIT" == true || -n "$FLOW_DINO_REVISION" ) ]]; then
+  echo '--obs-encoder resnet18 does not accept --dino, FLOW_DINO or --dino-revision' >&2
+  exit 2
+fi
 case "$FLOW_SELECTION" in
   both) FLOW_VARIANTS=(p2n_latent_flow p2n_state_gate_latent_flow) ;;
   p2n_latent_flow|p2n_state_gate_latent_flow) FLOW_VARIANTS=("$FLOW_SELECTION") ;;
@@ -115,11 +130,18 @@ fi
 FLOW_SOURCE_ARGS=()
 if [[ -n "$FLOW_RESUME" ]]; then
   FLOW_SOURCE_ARGS+=(--resume "$FLOW_RESUME")
-else
-  FLOW_SOURCE_ARGS+=(--dino "$FLOW_DINO")
+  # Preserve encoder inference: only forward explicit source flags on resume.
+  [[ "$FLOW_DINO_EXPLICIT" == false ]] || FLOW_SOURCE_ARGS+=(--dino "$FLOW_DINO")
   [[ -z "$FLOW_DINO_REVISION" ]] || FLOW_SOURCE_ARGS+=(--dino-revision "$FLOW_DINO_REVISION")
+else
+  FLOW_OBS_ENCODER="${FLOW_OBS_ENCODER:-dinov3}"
+  if [[ "$FLOW_OBS_ENCODER" == dinov3 ]]; then
+    FLOW_SOURCE_ARGS+=(--dino "$FLOW_DINO")
+    [[ -z "$FLOW_DINO_REVISION" ]] || FLOW_SOURCE_ARGS+=(--dino-revision "$FLOW_DINO_REVISION")
+  fi
   [[ -z "$FLOW_TOKENIZER" ]] || FLOW_SOURCE_ARGS+=(--tokenizer "$FLOW_TOKENIZER")
 fi
+[[ -z "$FLOW_OBS_ENCODER" ]] || FLOW_SOURCE_ARGS+=(--obs-encoder "$FLOW_OBS_ENCODER")
 FLOW_DEFAULT_OVERRIDES=(logging.mode=online)
 [[ -z "${FLOW_DATA:-}" ]] || FLOW_DEFAULT_OVERRIDES+=("task.policy.dataset.zarr_path=$FLOW_DATA")
 [[ -z "${FLOW_PROJECT:-}" ]] || FLOW_DEFAULT_OVERRIDES+=("logging.project=$FLOW_PROJECT")
@@ -129,12 +151,12 @@ FLOW_STAMP="$(date +%Y%m%d_%H%M%S)_$$"
 for FLOW_VARIANT in "${FLOW_VARIANTS[@]}"; do
   FLOW_OUTPUT_ARGS=()
   if [[ "$FLOW_SELECTION" == both ]]; then
-    FLOW_RUN="${FLOW_TASK}_${FLOW_VARIANT}_${FLOW_STAMP}"
+    FLOW_RUN="${FLOW_TASK}_${FLOW_VARIANT}_${FLOW_OBS_ENCODER}_${FLOW_STAMP}"
     FLOW_OUTPUT_ARGS=(--output "${FLOW_OUTPUT:-$FLOW_OUTPUT_ROOT}/$FLOW_RUN")
   elif [[ -n "$FLOW_OUTPUT" ]]; then
     FLOW_OUTPUT_ARGS=(--output "$FLOW_OUTPUT")
   elif [[ -z "$FLOW_RESUME" ]]; then
-    FLOW_RUN="${FLOW_TASK}_${FLOW_VARIANT}_${FLOW_STAMP}"
+    FLOW_RUN="${FLOW_TASK}_${FLOW_VARIANT}_${FLOW_OBS_ENCODER}_${FLOW_STAMP}"
     FLOW_OUTPUT_ARGS=(--output "$FLOW_OUTPUT_ROOT/$FLOW_RUN")
   fi
   "$FLOW_PYTHON" "$FLOW_ROOT/scripts/train_p2n_latent_flow.py" \

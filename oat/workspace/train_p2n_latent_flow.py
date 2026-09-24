@@ -26,6 +26,7 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 
 from oat.common.hydra_util import register_new_resolvers
+from oat.common.latent_flow_progress import FlowProgress
 from oat.common.checkpoint_util import TopKCheckpointManager
 from oat.common.p2n_new_capabilities import resolve_update_schedule
 from oat.model.common.lr_scheduler import get_scheduler
@@ -178,20 +179,25 @@ class MetricSums:
         unknown = set(metrics) - set(self.names)
         if unknown:
             raise KeyError(f"Unregistered metric names: {sorted(unknown)}")
+        pairs, rows = [], []
         for name, pair in metrics.items():
-            if isinstance(pair, dict):
-                numerator, denominator = pair["sum"], pair["count"]
-            else:
-                numerator, denominator = pair
+            numerator, denominator = (pair["sum"], pair["count"]) if isinstance(pair, dict) else pair
             numerator = torch.as_tensor(numerator, device=self.values.device, dtype=torch.float64)
             denominator = torch.as_tensor(denominator, device=self.values.device, dtype=torch.float64)
             if numerator.numel() != 1 or denominator.numel() != 1:
                 raise ValueError("Metric sums/counts must be scalars")
-            if not torch.isfinite(numerator) or not torch.isfinite(denominator) or denominator < 0:
-                raise ValueError(f"Nonfinite or negative metric accumulation: {name}")
-            row = self.names.index(name)
-            self.values[row, 0] += numerator.reshape(())
-            self.values[row, 1] += denominator.reshape(())
+            pairs.append(torch.stack((numerator.reshape(()), denominator.reshape(()))))
+            rows.append(self.names.index(name))
+        if not pairs:
+            return
+        # One finite/count check per batch instead of three GPU synchronizations
+        # per metric. Preserve sum/count validation and FP64 accumulation.
+        values = torch.stack(pairs)
+        valid = torch.isfinite(values).all() & (values[:, 1] >= 0).all()
+        if not bool(valid):
+            raise ValueError(f"Nonfinite or negative metric accumulation: {tuple(metrics)}")
+        indices = torch.tensor(rows, dtype=torch.long, device=self.values.device)
+        self.values.index_add_(0, indices, values)
 
     def reduce(self):
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -224,10 +230,40 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
         self.update_schedule = self.dataset_split = None
         self.best_metric = math.inf
         self.generators = {}
+        self._progress_tracking_enabled = False
         if not lazy_instantiation:
             self.model = hydra.utils.instantiate(cfg.policy)
             self.optimizer = self.model.get_optimizer(**cfg.optimizer)
             self.ema_model = make_fresh_ema(self.model)
+
+    def _emit_progress(self, accelerator, event):
+        # No collective here: validation ranks can have unequal/empty shards.
+        if not accelerator.is_main_process:
+            return
+        record = {**event, "global_step": self.global_step,
+                  "successful_optimizer_updates": self.completed_optimizer_steps,
+                  "skipped_optimizer_updates": self.skipped_optimizer_steps,
+                  "rank": accelerator.process_index}
+        output = Path(self.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        with (output / "progress.jsonl").open("a") as stream:
+            stream.write(json.dumps(record, allow_nan=False) + "\n")
+        accelerator.print(json.dumps(record, allow_nan=False), flush=True)
+        if self._progress_tracking_enabled:
+            phase = event["phase"]
+            values = {"global_step": self.global_step, "epoch": event["epoch"],
+                      "successful_optimizer_updates": self.completed_optimizer_steps}
+            values.update({f"{phase}/{key}": value for key, value in event.items()
+                           if key != "epoch" and isinstance(value, (int, float)) and not isinstance(value, bool)})
+            # Let W&B advance its event counter even when validation does not
+            # advance the training step. Charts use the explicit global_step.
+            accelerator.log(values)
+
+    def _progress(self, accelerator, phase, total, *, unit="batches", epoch=None):
+        return FlowProgress(phase, total, self.epoch if epoch is None else epoch,
+                            float(self.cfg.training.get("tqdm_interval_sec", 1.0)),
+                            lambda event: self._emit_progress(accelerator, event),
+                            unit=unit, enabled=accelerator.is_main_process)
 
     @staticmethod
     def validate_resume_payload(payload, cfg):
@@ -381,21 +417,23 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
         names = [f"{mode}_{name}" for mode in modes for name in METRICS]
         metrics = MetricSums(names, accelerator.device)
         sample_ids = []
+        progress = self._progress(accelerator, "validation", len(loader.sampler), unit="samples")
+        progress.update(0, force=True)
         for batch in loader:
+            # Read IDs before transfer; only tiny RNG draws are per sample.
+            # All observation, OAT, history and DiTX computations stay batched.
+            ids = [int(value) for value in batch["sample_id"].reshape(-1).tolist()]
+            seeds = [stable_validation_seed(int(self.cfg.training.seed), dataset.dataset_identity, value)
+                     for value in ids]
             batch = _move(batch, accelerator.device)
-            # Individual seeds deliberately decouple all stochastic evaluation
-            # from validation partitioning. Batched production inference remains
-            # available independently through predict_action.
-            for index in range(batch["action"].shape[0]):
-                sample = _slice_sample(batch, index)
-                sample_id = int(sample["sample_id"].item())
-                sample_ids.append(sample_id)
-                seed = stable_validation_seed(int(self.cfg.training.seed), dataset.dataset_identity, sample_id)
-                for mode in modes:
-                    generator = torch.Generator(device=accelerator.device).manual_seed(seed)
-                    with accelerator.autocast():
-                        measured = policy.validation_metrics(sample, generator=generator, history_mode=mode, compute_decoded=decode)
-                    metrics.add({f"{mode}_{key}": value for key, value in measured.items()})
+            for mode in modes:
+                with accelerator.autocast():
+                    measured = policy.validation_metrics(batch, sample_seeds=seeds,
+                        history_mode=mode, compute_decoded=decode)
+                metrics.add({f"{mode}_{key}": value for key, value in measured.items()})
+            sample_ids.extend(ids)
+            progress.update(len(sample_ids), metrics=lambda: {
+                "expert_fm_loss": float(metrics.values[0, 0] / metrics.values[0, 1])})
         # Different ranks may have different batch counts, including zero.
         # There are no collectives in the loop; every rank reduces exactly once.
         values = metrics.reduce()
@@ -442,6 +480,8 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
             kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False),
                              InitProcessGroupKwargs(timeout=timedelta(hours=2))])
         device = accelerator.device
+        setup_progress = self._progress(accelerator, "setup", 5, unit="stages")
+        setup_progress.update(0, {"stage": "constructing policy"}, force=True)
         set_seed(int(cfg.training.seed), device_specific=True)
         self.generators = {
             "train": torch.Generator(device=device).manual_seed(int(cfg.training.seed) + 1009 * accelerator.process_index + 11),
@@ -456,6 +496,7 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
             payload = self.validate_resume_payload(self._read_payload(path), cfg)
         construction = cfg.policy if payload is None else OmegaConf.create(payload["policy_config"])
         self.model = hydra.utils.instantiate(construction)
+        setup_progress.update(1, {"stage": "loading dataset"}, force=True)
         dataset = hydra.utils.instantiate(cfg.task.policy.dataset)
         val_dataset = dataset.get_validation_dataset()
         split = self._split_metadata(dataset, val_dataset)
@@ -475,6 +516,7 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
             if self.dataset_split != split:
                 raise ValueError("Resume data identity or actual episode masks differ")
         self.dataset_split = split
+        setup_progress.update(2, {"stage": "preparing student and EMA"}, force=True)
         train_kwargs = dict(_plain(cfg.dataloader))
         train_kwargs["generator"] = self.generators["dataloader"]
         if hasattr(dataset, "get_training_sampler"):
@@ -495,6 +537,7 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
         if payload is not None:
             self.ema_model.load_state_dict(payload["state_dicts"]["ema_model"], strict=True)
         assert_teacher_synchronized(self.ema_model)
+        setup_progress.update(3, {"stage": "building schedule and trackers"}, force=True)
         validate_optimizer_ownership(student, self.ema_model, self.optimizer)
         ema_kwargs = dict(_plain(cfg.ema))
         ema_kwargs.pop("_target_", None)
@@ -523,11 +566,18 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
             counts = {"trainable": sum(p.numel() for p in student.parameters() if p.requires_grad),
                       "frozen": sum(p.numel() for p in student.parameters() if not p.requires_grad)}
             accelerator.print(json.dumps({"parameters": counts, "update_schedule": schedule, "dataset_split": split}, indent=2))
+        setup_progress.update(4, {"stage": "starting experiment tracking"}, force=True)
         if log_with:
             logging = dict(_plain(cfg.logging))
             project = logging.pop("project")
             logging["dir"] = str(output)
             accelerator.init_trackers(project, config=_plain(cfg), init_kwargs={"wandb": logging})
+            if accelerator.is_main_process:
+                tracker = accelerator.get_tracker("wandb", unwrap=True)
+                tracker.define_metric("global_step")
+                tracker.define_metric("*", step_metric="global_step")
+            self._progress_tracking_enabled = True
+        setup_progress.update(5, {"stage": "ready"}, force=True)
         topk = None
         if accelerator.is_main_process and cfg.checkpoint.get("topk"):
             topk = TopKCheckpointManager(save_dir=str(output / "checkpoints"), **cfg.checkpoint.topk)
@@ -552,6 +602,8 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
             started = time.monotonic()
             epoch_loss = torch.zeros(2, dtype=torch.float64, device=device)
             n_batches = len(train_loader)
+            train_progress = self._progress(accelerator, "train", n_batches)
+            train_progress.update(0, force=True)
             for batch_index, batch in enumerate(train_loader):
                 batch = _move(batch, device)
                 # All teacher and self-past temporary activations disappear
@@ -588,6 +640,13 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
                     epoch_loss[0] += loss.detach().double() * batch["action"].shape[0]
                     epoch_loss[1] += batch["action"].shape[0]
                     self.global_step += 1
+                def train_metrics():
+                    result = {"loss": float(epoch_loss[0] / epoch_loss[1]),
+                              "batch_loss": float(loss.detach()), "lr": scheduler.get_last_lr()[0]}
+                    result.update({key: float(value) for key, value in getattr(student, "_last_flow_losses", {}).items()
+                                   if key != "loss"})
+                    return result
+                train_progress.update(batch_index + 1, metrics=train_metrics, force=batch_index == 0)
             epoch_loss = accelerator.reduce(epoch_loss, reduction="sum")
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -603,8 +662,10 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
             validation_due = self.epoch % int(cfg.training.get("val_every", 1)) == 0
             decoded_due = self.epoch % int(cfg.training.get("sample_every", 1)) == 0
             if validation_enabled and (validation_due or decoded_due):
+                validation_started = time.monotonic()
                 log.update(self._validate(accelerator, val_loader, val_dataset,
                                          generated=bool(cfg.training.get("validate_generated_history", True)), decode=decoded_due))
+                log["validation_seconds"] = time.monotonic() - validation_started
             if not cfg.task.policy.get("lazy_eval", True) and self.epoch % int(cfg.training.rollout_every) == 0:
                 accelerator.wait_for_everyone()
                 if runner is not None:
@@ -622,6 +683,9 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
             checkpoint_due = completed_epoch % int(cfg.training.checkpoint_every) == 0 or self.epoch == int(cfg.training.num_epochs)
             periodic = int(cfg.training.get("snapshot_every", 0))
             if accelerator.is_main_process:
+                checkpoint_started = time.monotonic()
+                checkpoint_progress = self._progress(accelerator, "checkpoint", 1, unit="epochs", epoch=completed_epoch)
+                checkpoint_progress.update(0, force=True)
                 wrapped = self.model
                 self.model = student
                 try:
@@ -641,10 +705,12 @@ class TrainP2NLatentFlowWorkspace(BaseWorkspace):
                         self.save_checkpoint(tag="best")
                 finally:
                     self.model = wrapped
+                log["checkpoint_seconds"] = time.monotonic() - checkpoint_started
+                checkpoint_progress.update(1, force=True)
                 with (output / "logs.json").open("a") as stream:
                     stream.write(json.dumps(log, allow_nan=False) + "\n")
                 if log_with:
-                    accelerator.log({key: value for key, value in log.items() if value is not None}, step=self.global_step)
+                    accelerator.log({key: value for key, value in log.items() if value is not None})
                 accelerator.print(json.dumps(log))
             accelerator.wait_for_everyone()
         if runner is not None:

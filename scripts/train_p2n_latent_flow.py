@@ -22,15 +22,38 @@ CONFIG_NAMES = {
 }
 
 
-def compose_config(variant, task, overrides=()):
+RESNET_CONFIG_NAMES = {
+    ("p2n_latent_flow", "libero"): "train_p2n_latent_flow_resnet18",
+    ("p2n_state_gate_latent_flow", "libero"): "train_p2n_state_gate_latent_flow_resnet18",
+    ("p2n_latent_flow", "real_robot"): "experimental/train_p2n_latent_flow_resnet18_real_robot",
+    ("p2n_state_gate_latent_flow", "real_robot"): "experimental/train_p2n_state_gate_latent_flow_resnet18_real_robot",
+}
+for _variant in ("p2n_latent_flow", "p2n_state_gate_latent_flow"):
+    CONFIG_NAMES[_variant, "pen_cabinet"] = f"experimental/train_{_variant}_pen_cabinet"
+    RESNET_CONFIG_NAMES[_variant, "pen_cabinet"] = f"experimental/train_{_variant}_resnet18_pen_cabinet"
+TASK_TYPES = {"libero": "libero", "real_robot": "real_robot", "pen_cabinet": "real_robot"}
+OBS_ENCODERS = ("dinov3", "resnet18")
+
+
+def observation_encoder(cfg):
+    # Artifacts created before the encoder option use frozen DINOv3.
+    return cfg.policy.get("obs_encoder_type", "dinov3")
+
+
+def compose_config(variant, task, overrides=(), *, obs_encoder="dinov3"):
     from hydra import compose, initialize_config_dir
+    if obs_encoder not in OBS_ENCODERS:
+        raise ValueError(f"Unknown observation encoder: {obs_encoder}")
+    if task not in TASK_TYPES:
+        raise ValueError(f"Unknown task: {task}")
+    names = RESNET_CONFIG_NAMES if obs_encoder == "resnet18" else CONFIG_NAMES
     with initialize_config_dir(config_dir=str(ROOT / "oat/config"), version_base=None):
-        cfg = compose(config_name=CONFIG_NAMES[variant, task], overrides=list(overrides))
-    validate_config(cfg, variant, task)
+        cfg = compose(config_name=names[variant, task], overrides=list(overrides))
+    validate_config(cfg, variant, task, obs_encoder=obs_encoder)
     return cfg
 
 
-def compose_resume_config(payload, variant, task, overrides=()):
+def compose_resume_config(payload, variant, task, overrides=(), *, obs_encoder=None):
     """Resume from saved resolved configuration, then apply explicit user overrides."""
     from hydra import compose, initialize_config_dir
     from hydra.core.config_store import ConfigStore
@@ -39,25 +62,39 @@ def compose_resume_config(payload, variant, task, overrides=()):
     if saved is None:
         raise ValueError("Resume artifact lacks its resolved training configuration")
     saved = OmegaConf.create(OmegaConf.to_container(saved, resolve=True) if OmegaConf.is_config(saved) else saved)
-    if saved.get("policy_family") != "oat_latent_flow" or saved.get("variant") != variant or saved.get("task_type") != task:
+    if saved.get("policy_family") != "oat_latent_flow" or saved.get("variant") != variant or saved.get("task_type") != TASK_TYPES.get(task):
         raise ValueError("Resume artifact family, variant or task differs from the selected command")
+    saved_encoder = observation_encoder(saved)
+    if obs_encoder is not None and obs_encoder != saved_encoder:
+        raise ValueError("Resume observation encoder differs from the selected --obs-encoder")
     # Register in memory only; no configuration file or external source is changed.
     name = "_latent_flow_saved_resume"
     ConfigStore.instance().store(name=name, node=saved)
     with initialize_config_dir(config_dir=str(ROOT / "oat/config"), version_base=None):
         cfg = compose(config_name=name, overrides=list(overrides))
-    validate_config(cfg, variant, task)
+    validate_config(cfg, variant, task, obs_encoder=saved_encoder)
     return cfg
 
 
-def validate_config(cfg, variant, task):
+def validate_config(cfg, variant, task, *, obs_encoder=None):
+    encoder = observation_encoder(cfg)
+    if encoder not in OBS_ENCODERS or (obs_encoder is not None and encoder != obs_encoder):
+        raise ValueError("Selected observation encoder and policy.obs_encoder_type must agree")
+    if encoder == "resnet18":
+        if any(cfg.policy.get(key) is not None for key in ("dino_path", "dino_revision", "dino_config", "processor_config")):
+            raise ValueError("ResNet-18 observation encoder does not accept DINO source/config overrides")
+        if not cfg.policy.get("resnet_config"):
+            raise ValueError("ResNet-18 observation encoder requires resnet_config")
     gate = variant == "p2n_state_gate_latent_flow"
     cls = "P2NStateGateLatentFlowPolicy" if gate else "P2NLatentFlowPolicy"
     expected = f"oat.policy.{variant}.{cls}"
     if cfg.policy_family != "oat_latent_flow" or cfg.variant != variant or cfg.policy.variant != variant or cfg.policy._target_ != expected:
         raise ValueError("Selected flow family, variant and policy target must agree")
-    if cfg.task_type != task or cfg.policy.task != task:
+    expected_task_type = TASK_TYPES.get(task)
+    if expected_task_type is None or cfg.task_type != expected_task_type or cfg.policy.task != expected_task_type:
         raise ValueError("Selected task and policy task must agree")
+    if task == "pen_cabinet" and cfg.task.policy.task_name != "pen_cabinet_N67":
+        raise ValueError("Selected pen_cabinet task requires the pen_cabinet_N67 recipe")
     if cfg.training.get("init_checkpoint"):
         raise ValueError("AR warm-start is unsupported; select fresh flow training or flow resume")
     if cfg.training.resume and not cfg.training.get("resume_checkpoint"):
@@ -72,7 +109,7 @@ def validate_config(cfg, variant, task):
     ds = cfg.task.policy.dataset
     if ds.history_padding != "zero" or ds.return_history_validity is not True:
         raise ValueError("Both flow variants require zero history padding and explicit validity")
-    dataset_name = ("LatentFlowRealRobot" if task == "real_robot" else "LatentFlow") + ("ZarrDatasetWithStateHistory" if gate else "ZarrDatasetWithPrevWindow")
+    dataset_name = ("LatentFlowRealRobot" if expected_task_type == "real_robot" else "LatentFlow") + ("ZarrDatasetWithStateHistory" if gate else "ZarrDatasetWithPrevWindow")
     if ds._target_ != "oat.dataset.latent_flow_dataset." + dataset_name:
         raise ValueError("Selected variant/task does not match the flow dataset adapter")
     if not gate and any(k.startswith("history_") or k.startswith("state_history") for k in cfg.policy):
@@ -81,7 +118,7 @@ def validate_config(cfg, variant, task):
         raise ValueError("Gate flow recipe requires eight measured states, four summaries and zero dropout")
     if gate and cfg.policy.history_gate_mode != "learned":
         raise ValueError("Formal flow training requires history_gate_mode=learned; open/closed are test-only")
-    if task == "real_robot":
+    if expected_task_type == "real_robot":
         if cfg.task.policy.env_runner is not None or cfg.task.policy.lazy_eval is not True:
             raise ValueError("Real-robot flow uses offline evaluation and no simulator runner")
         if gate and ("robot0_eef_rot6d" not in cfg.policy.state_history_keys or cfg.policy.rotation_6d_layout != "rows"):
@@ -222,8 +259,18 @@ def preflight(cfg, output, world_size=2, resume_payload=None):
         # Resume constructs both frozen architectures from this complete artifact.
         sources = {"resume": str(path.resolve()), "external_frozen_sources_required": False}
     else:
-        sources = {"dino": validate_dino_source(cfg), "oat": validate_tokenizer_source(cfg)}
-        cfg.policy.dino_revision = sources["dino"]["revision"]
+        sources = {"oat": validate_tokenizer_source(cfg)}
+        if observation_encoder(cfg) == "dinov3":
+            sources["dino"] = validate_dino_source(cfg)
+            cfg.policy.dino_revision = sources["dino"]["revision"]
+        else:
+            from omegaconf import OmegaConf
+            sources["resnet18"] = {
+                "encoder": "oat.perception.robomimic_vision_encoder.RobomimicRgbEncoder",
+                "backbone": "ResNet18Conv", "initialization": "random", "pretrained": False,
+                "config": OmegaConf.to_container(cfg.policy.resnet_config, resolve=True),
+                "external_vision_checkpoint_required": False,
+            }
     sampler = torch.utils.data.BatchSampler(torch.utils.data.SequentialSampler(range(split["train"]["windows"])),
         batch_size=int(cfg.dataloader.batch_size), drop_last=True)
     batches = len(BatchSamplerShard(sampler, num_processes=world_size, process_index=0))
@@ -231,6 +278,7 @@ def preflight(cfg, output, world_size=2, resume_payload=None):
         max_train_steps=cfg.training.max_train_steps, warmup_steps=cfg.training.lr_warmup_steps,
         warmup_ratio=float(cfg.training.lr_warmup_ratio))
     return {"policy_family": cfg.policy_family, "variant": cfg.variant, "task": cfg.task_type,
+            "obs_encoder": observation_encoder(cfg), "task_name": cfg.task.policy.task_name,
             "world_size": world_size, "effective_batch": int(cfg.dataloader.batch_size) * world_size * int(cfg.training.gradient_accumulate_every),
             "dataset_split": split, "sources": sources, "update_schedule": schedule,
             "output": str(output), "status": "CPU source/schema preflight passed; no model, GPU work or training started",
@@ -270,9 +318,12 @@ def main(argv=None):
         overrides, argv = argv[index + 1:], argv[:index]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", choices=("p2n_latent_flow", "p2n_state_gate_latent_flow"), required=True)
-    parser.add_argument("--task", choices=("libero", "real_robot"), required=True)
+    parser.add_argument("--task", choices=tuple(TASK_TYPES), required=True,
+                        help="pen_cabinet selects its dataset and OAT; real_robot retains the nut-washer recipe")
     parser.add_argument("--gpus", required=True, help="Explicit physical GPU indices, e.g. 2,3; dry-run does not inspect/use them")
     parser.add_argument("--num-processes", type=int, help="Defaults to the number of selected GPUs; must match")
+    parser.add_argument("--obs-encoder", choices=OBS_ENCODERS,
+                        help="Fresh runs default to dinov3; resume infers the saved encoder")
     parser.add_argument("--tokenizer")
     parser.add_argument("--dino")
     parser.add_argument("--dino-revision")
@@ -300,10 +351,13 @@ def main(argv=None):
         import dill
         import torch
         payload = torch.load(args.resume, map_location="cpu", pickle_module=dill, weights_only=False)
-        cfg = compose_resume_config(payload, args.variant, args.task, [*generated, *overrides])
+        cfg = compose_resume_config(payload, args.variant, args.task, [*generated, *overrides],
+                                    obs_encoder=args.obs_encoder)
     else:
-        cfg = compose_config(args.variant, args.task, [*generated, *overrides])
-    output = (args.output or ROOT / "output/training" / f"{args.variant}_{args.task}_seed{cfg.seed}").resolve()
+        cfg = compose_config(args.variant, args.task, [*generated, *overrides],
+                             obs_encoder=args.obs_encoder or "dinov3")
+    encoder = observation_encoder(cfg)
+    output = (args.output or ROOT / "output/training" / f"{args.variant}_{encoder}_{args.task}_seed{cfg.seed}").resolve()
     print(OmegaConf.to_yaml(cfg, resolve=True))
     report = preflight(cfg, output, world_size, resume_payload=payload) if payload is not None else preflight(cfg, output, world_size)
     print(json.dumps(report, indent=2))

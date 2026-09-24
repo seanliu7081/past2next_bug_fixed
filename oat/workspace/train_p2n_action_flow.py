@@ -412,6 +412,8 @@ class TrainP2NActionFlowWorkspace(BaseWorkspace):
         cfg = OmegaConf.create(_plain(payload["cfg"]))
         cfg.training.resume = True
         cfg.training.resume_checkpoint = str(path)
+        if cfg.get("logging") is not None:
+            cfg.logging.mode = "online"
         cls.validate_resume_payload(payload, cfg)
         instance = cls(cfg, output_dir)
         instance.model = hydra.utils.instantiate(OmegaConf.create(payload["policy_config"]))
@@ -490,7 +492,7 @@ class TrainP2NActionFlowWorkspace(BaseWorkspace):
             raise ValueError("max_val_steps/max_reconst_steps must be null for complete validation coverage")
         accumulation = int(cfg.training.gradient_accumulate_every)
         use_bf16 = bool(cfg.training.allow_bf16) and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        log_with = "wandb" if cfg.get("logging") and cfg.logging.get("mode", "offline") != "disabled" else None
+        log_with = "wandb" if cfg.get("logging") and cfg.logging.get("mode", "online") != "disabled" else None
         accelerator = Accelerator(
             gradient_accumulation_steps=accumulation, mixed_precision="bf16" if use_bf16 else "no",
             log_with=log_with,
@@ -677,12 +679,12 @@ class TrainP2NActionFlowWorkspace(BaseWorkspace):
             is_best = score is not None and score < self.best_metric
             if is_best:
                 self.best_metric = score
-            completed_epoch = self.epoch
             self.epoch += 1
+            # The resume counter now equals the number of completed epochs.
             self.ema_state = {"optimization_step": ema.optimization_step, "decay": ema.decay}
             self.lr_scheduler_state = copy.deepcopy(scheduler.state_dict())
             self._gather_rng(accelerator)
-            checkpoint_due = completed_epoch % int(cfg.training.checkpoint_every) == 0 or self.epoch == int(cfg.training.num_epochs)
+            checkpoint_due = self.epoch % int(cfg.training.checkpoint_every) == 0 or self.epoch == int(cfg.training.num_epochs)
             periodic = int(cfg.training.get("snapshot_every", 0))
             if accelerator.is_main_process:
                 wrapped = self.model
@@ -690,8 +692,8 @@ class TrainP2NActionFlowWorkspace(BaseWorkspace):
                 try:
                     if checkpoint_due and cfg.checkpoint.get("save_last_ckpt", True):
                         self.save_checkpoint(tag="latest")
-                    if periodic > 0 and completed_epoch % periodic == 0:
-                        self.save_checkpoint(tag=f"ep-{completed_epoch:04d}")
+                    if periodic > 0 and self.epoch % periodic == 0:
+                        self.save_checkpoint(tag=f"ep-{self.epoch:04d}")
                     if checkpoint_due and cfg.checkpoint.get("save_last_snapshot", False):
                         self.save_checkpoint(path=output / "snapshots" / "latest.ckpt")
                     if checkpoint_due and cfg.checkpoint.get("save_all", False):

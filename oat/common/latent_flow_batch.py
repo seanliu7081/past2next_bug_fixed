@@ -1,6 +1,6 @@
 """Detached data crossing the single DDP student forward boundary."""
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Optional
 import torch
 
 @dataclass
@@ -14,7 +14,9 @@ class PreparedFlowBatch:
     obs: Mapping[str, torch.Tensor]
     past_actions: torch.Tensor
     past_action_valid: torch.Tensor
-    frozen_patches: torch.Tensor
+    frozen_patches: Optional[torch.Tensor] = None
+    prepared_visual: Optional[torch.Tensor] = None
+    obs_encoder_type: str = 'dinov3'
 
     def validate(self):
         batch = self.noisy_latents.shape[0]
@@ -33,8 +35,18 @@ class PreparedFlowBatch:
             raise ValueError('Training requires a 3:1 split and microbatch divisible by four')
         if self.past_action_valid.dtype != torch.bool or self.past_action_valid.shape != self.past_actions.shape[:2]:
             raise ValueError('Historical command validity must be bool [B,past_n]')
-        if self.frozen_patches.requires_grad or self.past_actions.requires_grad:
+        if self.obs_encoder_type not in ('dinov3', 'resnet18'):
+            raise ValueError('Unknown observation encoder in prepared flow batch')
+        visual = self.frozen_patches if self.obs_encoder_type == 'dinov3' else self.prepared_visual
+        other = self.prepared_visual if self.obs_encoder_type == 'dinov3' else self.frozen_patches
+        if not isinstance(visual, torch.Tensor) or other is not None:
+            raise ValueError('Prepared visual inputs must match the observation encoder')
+        if visual.shape[0] != batch or visual.device != self.noisy_latents.device:
+            raise ValueError('Prepared visual inputs must share the flow batch and device')
+        if visual.requires_grad or self.past_actions.requires_grad:
             raise ValueError('Prepared conditioning must be detached')
+        if not torch.isfinite(visual).all():
+            raise ValueError('Prepared visual inputs must be finite')
         return self
 
 FlowTrainingBatch = PreparedFlowBatch

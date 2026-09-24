@@ -1,15 +1,11 @@
 # @package _global_
 defaults:
-  - /train_p2n_state_gate_action_flow
+  - /train_p2n_action_flow_resnet18
   - override /task/policy: real_robot/nut_washer_with_prev_window
   - _self_
 
-name: train_p2n_state_gate_action_flow_real_robot
+name: train_p2n_action_flow_resnet18_real_robot
 task_type: real_robot
-state_history_keys: [robot0_eef_pos, robot0_eef_rot6d, robot0_gripper_qpos]
-
-policy:
-  rotation_6d_layout: rows
 
 action_schema:
   control_frequency_hz: 30
@@ -48,14 +44,12 @@ task:
     lazy_eval: true
     env_runner: null
     dataset:
-      _target_: oat.dataset.action_flow_dataset.ActionFlowRealRobotZarrDatasetWithStateHistory
+      _target_: oat.dataset.action_flow_dataset.ActionFlowRealRobotZarrDatasetWithPrevWindow
       zarr_path: /workspace/ysk/zarr/nut_washer_v3_N77.zarr
       val_ratio: 0.05
       seed: 42
-      state_history_steps: ${state_history_steps}
-      state_history_keys: ${state_history_keys}
       history_padding: zero
       return_history_validity: true
 
 logging:
-  project: real_robot_p2n_action_flow
+  project: real_robot_p2n_action_flow_resnet18

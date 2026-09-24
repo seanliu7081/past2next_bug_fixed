@@ -13,7 +13,8 @@ bash train_p2n_action_flow.sh \
   --gpus 2,3 \
   --batch-size 4 \
   --val-batch-size 4 \
-  --grad-accum 8
+  --grad-accum 8 \
+  --save-every 20
 ```
 
 This runs `p2n_action_flow` then `p2n_state_gate_action_flow`, each on both
@@ -21,7 +22,8 @@ selected GPUs, with separate timestamped output directories. Defaults use the
 local DINOv3-S/16 snapshot, `nut_washer_v3_N77.zarr`, 2001 epochs, eight Euler
 steps, and an effective training batch of 64. No tokenizer checkpoint is needed.
 The launcher checks GPU availability immediately before each training run.
-Logging defaults to offline W&B; set `-- logging.mode=online` if wanted.
+W&B logging defaults to online for fresh training and resume; the launcher also
+exports `WANDB_MODE=online`. No extra logging flag is needed.
 
 Use `--variant p2n_action_flow` or `--variant p2n_state_gate_action_flow` for
 one variant. Add `--dry-run` for local CPU data/normalizer/DINO checks without
@@ -32,7 +34,7 @@ Overrides after `--` take precedence over convenience flags, for example:
 ```bash
 bash train_p2n_action_flow.sh --variant p2n_action_flow \
   --gpus 2,3 --batch-size 4 --val-batch-size 4 --grad-accum 8 \
-  -- training.num_epochs=100 logging.mode=offline
+  -- training.num_epochs=100 logging.mode=online
 ```
 
 ## Implementation
@@ -111,3 +113,11 @@ The opt-in DDP smoke script has a `--real --dino PATH` mode that exercises the
 full network, CT/self-past/Adam/EMA, expert/generated validation, and both
 sampling step counts, reporting synchronized p50/p95 timings and memory.
 Deployment defaults remain eight steps; two-step quality must be measured.
+
+Periodic checkpoint saving defaults to every 20 completed epochs. Use
+`--save-every N` to set both the latest-checkpoint and numbered-snapshot
+intervals, including when resuming. For `--save-every 20`, numbered files
+are `checkpoints/ep-0020.ckpt`, `ep-0040.ckpt`, and so on. `latest.ckpt`
+is also saved at the end of training; metric-ranked best checkpoints can
+still be saved between these intervals. Existing resumes retain their saved
+intervals unless `--save-every` or explicit Hydra overrides are supplied.

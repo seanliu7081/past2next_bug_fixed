@@ -1,0 +1,36 @@
+# @package _global_
+defaults:
+  - /train_p2n_latent_flow
+  - override /task/policy: real_robot/pen_cabinet_with_prev_window
+  - _self_
+
+name: train_p2n_latent_flow_pen_cabinet
+task_type: real_robot
+
+policy:
+  tokenizer_checkpoint: /workspace/ysk/past2next_bug_fixed/output/training/pen_cabinet_N67_current_20260919_212551/tokenizer/checkpoints/ep-2950_mse-0.000.ckpt
+
+training:
+  num_demo: 67
+  num_epochs: 2001
+  checkpoint_every: 50
+  snapshot_every: 50
+  offline_validation_reason: held_out_pen_cabinet_N67_episodes
+
+task:
+  policy:
+    name: real_robot_pen_cabinet_N67
+    task_name: pen_cabinet_N67
+    lazy_eval: true
+    env_runner: null
+    dataset:
+      _target_: oat.dataset.latent_flow_dataset.LatentFlowRealRobotZarrDatasetWithPrevWindow
+      zarr_path: /workspace/ysk/zarr/pen_cabinet_N67.zarr
+      val_ratio: 0.1
+      seed: 42
+      history_padding: zero
+      return_history_validity: true
+
+logging:
+  project: real_robot_p2n_latent_flow
+  group: ${variant}_pen_cabinet

@@ -1,0 +1,24 @@
+# @package _global_
+# Dataset/schema: task/policy/real_robot/fruits_v2_with_prev_window.yaml.
+# Keep the direct action-flow real-robot recipe, including 2001 epochs.
+defaults:
+  - /experimental/train_p2n_action_flow_resnet18_real_robot
+  - override /task/policy: real_robot/fruits_v2_with_prev_window
+  - _self_
+
+name: train_p2n_action_flow_resnet18_fruits_v2
+
+training:
+  num_demo: 49
+  offline_validation_reason: held_out_fruits_v2_N49_episodes
+
+task:
+  policy:
+    name: real_robot_fruits_v2
+    task_name: fruits_v2
+    dataset:
+      zarr_path: /workspace/ysk/zarr/fruits_v2_N49.zarr
+      val_ratio: 0.1
+
+logging:
+  group: ${variant}_resnet18_fruits_v2

@@ -1,12 +1,13 @@
+# Trainable original ResNet-18 + SpatialSoftmax; random initialization, no external weights.
 defaults:
   - task/policy: libero/libero10_with_prev_window
   - _self_
 
-name: train_p2n_action_flow
+name: train_p2n_action_flow_resnet18
 policy_family: continuous_action_flow
 variant: p2n_action_flow
 task_type: libero
-_target_: oat.workspace.train_p2n_action_flow.TrainP2NActionFlowWorkspace
+_target_: oat.workspace.train_p2n_action_flow_resnet18.TrainP2NActionFlowResNet18Workspace
 seed: 42
 horizon: 16
 n_action_steps: 8
@@ -16,7 +17,7 @@ task_name: ${task.policy.name}
 shape_meta: ${task.policy.shape_meta}
 
 policy:
-  _target_: oat.policy.p2n_action_flow.P2NActionFlowPolicy
+  _target_: oat.policy.p2n_action_flow_resnet18.P2NActionFlowResNet18Policy
   variant: ${variant}
   task: ${task_type}
   shape_meta: ${shape_meta}
@@ -25,20 +26,17 @@ policy:
   past_n: ${past_n}
   horizon: ${horizon}
   construction_mode: fresh
-  dino_path: null
-  dino_revision: null
+  obs_encoder_type: resnet18
+  resnet_config:
+    crop_shape: [112, 112]
+    use_group_norm: true
+    share_rgb_model: false
+    eval_fixed_crop: true
   action_dim: 7
   action_schema: ${action_schema}
-  rgb_range: uint8
-  image_brightness: 0.1
-  image_contrast: 0.1
-  num_visual_queries: 64
-  resampler_depth: 2
   embed_dim: 768
   n_layers: 16
   n_heads: 12
-  resampler_ffn_type: swiglu
-  resampler_ffn_dim: 2048
   dropout: 0.0
   activation_checkpointing: true
   self_past_p: 0.5
@@ -178,13 +176,13 @@ task:
       n_parallel_envs: 10
 
 logging:
-  project: p2n_action_flow
+  project: p2n_action_flow_resnet18
   resume: false
   mode: online
-  name: ${now:%Y%m%d.%H%M%S}_${variant}_${task_name}_seed${seed}
-  tags: ['${variant}', '${task_name}', 'dinov3_vits16']
+  name: ${now:%Y%m%d.%H%M%S}_${variant}_resnet18_${task_name}_seed${seed}
+  tags: ['${variant}', '${task_name}', 'resnet18']
   id: null
-  group: ${variant}_${task_type}
+  group: ${variant}_resnet18_${task_type}
 
 checkpoint:
   topk:
@@ -198,6 +196,6 @@ checkpoint:
 
 hydra:
   run:
-    dir: output/training/${variant}_${task_type}_${now:%Y%m%d_%H%M%S}_seed${seed}
+    dir: output/training/${variant}_resnet18_${task_type}_${now:%Y%m%d_%H%M%S}_seed${seed}
   job:
     chdir: false

@@ -1,0 +1,24 @@
+# @package _global_
+# Dataset/schema: task/policy/real_robot/pen_cabinet_with_prev_window.yaml.
+# Keep the direct action-flow real-robot recipe, including 2001 epochs.
+defaults:
+  - /experimental/train_p2n_state_gate_action_flow_resnet18_real_robot
+  - override /task/policy: real_robot/pen_cabinet_with_prev_window
+  - _self_
+
+name: train_p2n_state_gate_action_flow_resnet18_pen_cabinet
+
+training:
+  num_demo: 67
+  offline_validation_reason: held_out_pen_cabinet_N67_episodes
+
+task:
+  policy:
+    name: real_robot_pen_cabinet_N67
+    task_name: pen_cabinet_N67
+    dataset:
+      zarr_path: /workspace/ysk/zarr/pen_cabinet_N67.zarr
+      val_ratio: 0.1
+
+logging:
+  group: ${variant}_resnet18_pen_cabinet
