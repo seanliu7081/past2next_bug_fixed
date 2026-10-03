@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - /experimental/train_p2n_state_gate_new_real_robot
+  - _self_
+
+name: train_p2n_state_gate_new_convnext_nano_real_robot
+_target_: oat.workspace.train_p2n_new_convnext.TrainP2NNewWorkspace
+
+policy:
+  _target_: oat.policy.p2n_new_convnext.P2NStateGateNewPolicy
+  obs_encoder_type: convnextv2_tokens
+  expected_action_tokens: 8
+  dino_path: null
+  dino_revision: null
+  convnext_model_name: convnextv2_nano.fcmae_ft_in22k_in1k
+  convnext_path: null
+  convnext_revision: null
+  convnext_frozen: true
+  vision_image_size: 224
+  vision_feature_stages: [2, 3]
+  visual_resampler_dim: 256
+  visual_resampler_heads: 4
+  visual_resampler_ffn_dim: 768
+
+logging:
+  name: ${now:%Y%m%d.%H%M%S}_${variant}_convnext_nano_${task_name}_seed${seed}
+  tags: ['${variant}', '${task_name}', 'convnextv2_nano']
+  group: ${variant}_convnext_nano_${task_type}
+
+hydra:
+  run:
+    dir: output/training/${variant}_convnext_nano_${task_type}_${now:%Y%m%d_%H%M%S}_seed${seed}

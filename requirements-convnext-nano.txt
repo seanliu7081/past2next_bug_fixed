@@ -1,0 +1,2 @@
+# Install into the selected training environment; backbone weights remain local.
+timm==1.0.29
