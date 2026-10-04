@@ -1,0 +1,433 @@
+{
+  "status": "passed",
+  "scope": "synthetic two-rank correctness smoke; tiny OAT",
+  "world_size": 2,
+  "device": "cuda",
+  "measurements_note": "Instrumented timings; first Adam update excluded from aggregate throughput. No production speed claim.",
+  "runs": [
+    {
+      "variant": "p2n_new",
+      "rank": 0,
+      "self_past_probability": 0.0,
+      "context_tokens": 11,
+      "observation_tokens": 2,
+      "crop_shape": [
+        112,
+        112
+      ],
+      "cnn_trainable": true,
+      "batch_per_rank": 2,
+      "accumulation": 2,
+      "ar": "production_16x768",
+      "oat": "tiny_real_fsq",
+      "precision": "bf16",
+      "successful_optimizer_updates": 4,
+      "all_trainable_gradients_finite": true,
+      "exact_rng_continuation": true,
+      "strict_resume_matches_uninterrupted": true,
+      "measurements": [
+        {
+          "data_wait_seconds": 0.012290421407669783,
+          "forward_seconds": 1.0230103051289916,
+          "backward_seconds": 0.4684260101057589,
+          "optimizer_and_ema_seconds": 0.1497941380366683,
+          "step_seconds": 1.6787058599293232,
+          "loss": 1.8212890625
+        },
+        {
+          "data_wait_seconds": 0.008527231868356466,
+          "forward_seconds": 0.09654449112713337,
+          "backward_seconds": 0.17254372593015432,
+          "optimizer_and_ema_seconds": 0.020118061918765306,
+          "step_seconds": 0.32119557075202465,
+          "loss": 0.0006496906280517578
+        },
+        {
+          "data_wait_seconds": 0.00770731084048748,
+          "forward_seconds": 0.08027219725772738,
+          "backward_seconds": 0.14867241494357586,
+          "optimizer_and_ema_seconds": 0.019865371752530336,
+          "step_seconds": 0.2791560119949281,
+          "loss": 0.0002529621124267578
+        }
+      ],
+      "step_p50_seconds": 0.3001757913734764,
+      "throughput_local_examples_per_second": 13.325524958883946,
+      "cuda_peak": {
+        "allocated_bytes": 4815167488,
+        "reserved_bytes": 5182062592
+      }
+    },
+    {
+      "variant": "p2n_new",
+      "rank": 0,
+      "self_past_probability": 0.5,
+      "context_tokens": 11,
+      "observation_tokens": 2,
+      "crop_shape": [
+        112,
+        112
+      ],
+      "cnn_trainable": true,
+      "batch_per_rank": 2,
+      "accumulation": 2,
+      "ar": "production_16x768",
+      "oat": "tiny_real_fsq",
+      "precision": "bf16",
+      "successful_optimizer_updates": 4,
+      "all_trainable_gradients_finite": true,
+      "exact_rng_continuation": true,
+      "strict_resume_matches_uninterrupted": true,
+      "measurements": [
+        {
+          "data_wait_seconds": 0.007257737219333649,
+          "forward_seconds": 0.2747049108147621,
+          "backward_seconds": 0.22191171301528811,
+          "optimizer_and_ema_seconds": 0.042136379051953554,
+          "step_seconds": 0.5687952907755971,
+          "loss": 1.64501953125
+        },
+        {
+          "data_wait_seconds": 0.00758356973528862,
+          "forward_seconds": 0.2054122514091432,
+          "backward_seconds": 0.1525568151846528,
+          "optimizer_and_ema_seconds": 0.01986235100775957,
+          "step_seconds": 0.4072959329932928,
+          "loss": 0.0005065202713012695
+        },
+        {
+          "data_wait_seconds": 0.008050341159105301,
+          "forward_seconds": 0.2004386787302792,
+          "backward_seconds": 0.16842980589717627,
+          "optimizer_and_ema_seconds": 0.01999278226867318,
+          "step_seconds": 0.4194353851489723,
+          "loss": 0.0002098679542541504
+        }
+      ],
+      "step_p50_seconds": 0.41336565907113254,
+      "throughput_local_examples_per_second": 9.676662567926753,
+      "cuda_peak": {
+        "allocated_bytes": 5797507584,
+        "reserved_bytes": 6612320256
+      }
+    },
+    {
+      "variant": "p2n_state_gate_new",
+      "rank": 0,
+      "self_past_probability": 0.0,
+      "context_tokens": 15,
+      "observation_tokens": 2,
+      "crop_shape": [
+        112,
+        112
+      ],
+      "cnn_trainable": true,
+      "batch_per_rank": 2,
+      "accumulation": 2,
+      "ar": "production_16x768",
+      "oat": "tiny_real_fsq",
+      "precision": "bf16",
+      "successful_optimizer_updates": 4,
+      "all_trainable_gradients_finite": true,
+      "exact_rng_continuation": true,
+      "strict_resume_matches_uninterrupted": true,
+      "measurements": [
+        {
+          "data_wait_seconds": 0.00791673082858324,
+          "forward_seconds": 0.19546625623479486,
+          "backward_seconds": 0.26189478673040867,
+          "optimizer_and_ema_seconds": 0.11617474118247628,
+          "step_seconds": 0.6052519748918712,
+          "loss": 1.96875
+        },
+        {
+          "data_wait_seconds": 0.007760238833725452,
+          "forward_seconds": 0.09580114763230085,
+          "backward_seconds": 0.17628654558211565,
+          "optimizer_and_ema_seconds": 0.024153083097189665,
+          "step_seconds": 0.3271180856972933,
+          "loss": 0.0006399154663085938
+        },
+        {
+          "data_wait_seconds": 0.009399774949997663,
+          "forward_seconds": 0.09129182621836662,
+          "backward_seconds": 0.1714674332179129,
+          "optimizer_and_ema_seconds": 0.020109711680561304,
+          "step_seconds": 0.31541161611676216,
+          "loss": 0.00027382373809814453
+        }
+      ],
+      "step_p50_seconds": 0.3212648509070277,
+      "throughput_local_examples_per_second": 12.45078628647607,
+      "cuda_peak": {
+        "allocated_bytes": 5631037952,
+        "reserved_bytes": 5989466112
+      }
+    },
+    {
+      "variant": "p2n_state_gate_new",
+      "rank": 0,
+      "self_past_probability": 0.5,
+      "context_tokens": 15,
+      "observation_tokens": 2,
+      "crop_shape": [
+        112,
+        112
+      ],
+      "cnn_trainable": true,
+      "batch_per_rank": 2,
+      "accumulation": 2,
+      "ar": "production_16x768",
+      "oat": "tiny_real_fsq",
+      "precision": "bf16",
+      "successful_optimizer_updates": 4,
+      "all_trainable_gradients_finite": true,
+      "exact_rng_continuation": true,
+      "strict_resume_matches_uninterrupted": true,
+      "measurements": [
+        {
+          "data_wait_seconds": 0.008432792034000158,
+          "forward_seconds": 0.20499909995123744,
+          "backward_seconds": 0.2937452085316181,
+          "optimizer_and_ema_seconds": 0.040802276227623224,
+          "step_seconds": 0.5723596401512623,
+          "loss": 2.02490234375
+        },
+        {
+          "data_wait_seconds": 0.008330450858920813,
+          "forward_seconds": 0.19655715860426426,
+          "backward_seconds": 0.17020315025001764,
+          "optimizer_and_ema_seconds": 0.024827174376696348,
+          "step_seconds": 0.4240916362032294,
+          "loss": 0.0006138086318969727
+        },
+        {
+          "data_wait_seconds": 0.008899464271962643,
+          "forward_seconds": 0.20192469097673893,
+          "backward_seconds": 0.17843092046678066,
+          "optimizer_and_ema_seconds": 0.020231562200933695,
+          "step_seconds": 0.4372450402006507,
+          "loss": 0.000286102294921875
+        }
+      ],
+      "step_p50_seconds": 0.43066833820194006,
+      "throughput_local_examples_per_second": 9.287889647751173,
+      "cuda_peak": {
+        "allocated_bytes": 5540222976,
+        "reserved_bytes": 5867831296
+      }
+    },
+    {
+      "variant": "p2n_new",
+      "rank": 1,
+      "self_past_probability": 0.0,
+      "context_tokens": 11,
+      "observation_tokens": 2,
+      "crop_shape": [
+        112,
+        112
+      ],
+      "cnn_trainable": true,
+      "batch_per_rank": 2,
+      "accumulation": 2,
+      "ar": "production_16x768",
+      "oat": "tiny_real_fsq",
+      "precision": "bf16",
+      "successful_optimizer_updates": 4,
+      "all_trainable_gradients_finite": true,
+      "exact_rng_continuation": true,
+      "strict_resume_matches_uninterrupted": true,
+      "measurements": [
+        {
+          "data_wait_seconds": 0.015045360196381807,
+          "forward_seconds": 1.0240872572176158,
+          "backward_seconds": 0.46091199154034257,
+          "optimizer_and_ema_seconds": 0.15670593501999974,
+          "step_seconds": 1.6860680389218032,
+          "loss": 1.9150390625
+        },
+        {
+          "data_wait_seconds": 0.009000644087791443,
+          "forward_seconds": 0.09843148477375507,
+          "backward_seconds": 0.16096607595682144,
+          "optimizer_and_ema_seconds": 0.019887670874595642,
+          "step_seconds": 0.313651611097157,
+          "loss": 0.0005977153778076172
+        },
+        {
+          "data_wait_seconds": 0.008666351903229952,
+          "forward_seconds": 0.08084513945505023,
+          "backward_seconds": 0.14576549781486392,
+          "optimizer_and_ema_seconds": 0.019764140713959932,
+          "step_seconds": 0.2789295110851526,
+          "loss": 0.00027549266815185547
+        }
+      ],
+      "step_p50_seconds": 0.2962905610911548,
+      "throughput_local_examples_per_second": 13.500261315342362,
+      "cuda_peak": {
+        "allocated_bytes": 4815167488,
+        "reserved_bytes": 5182062592
+      }
+    },
+    {
+      "variant": "p2n_new",
+      "rank": 1,
+      "self_past_probability": 0.5,
+      "context_tokens": 11,
+      "observation_tokens": 2,
+      "crop_shape": [
+        112,
+        112
+      ],
+      "cnn_trainable": true,
+      "batch_per_rank": 2,
+      "accumulation": 2,
+      "ar": "production_16x768",
+      "oat": "tiny_real_fsq",
+      "precision": "bf16",
+      "successful_optimizer_updates": 4,
+      "all_trainable_gradients_finite": true,
+      "exact_rng_continuation": true,
+      "strict_resume_matches_uninterrupted": true,
+      "measurements": [
+        {
+          "data_wait_seconds": 0.008483451791107655,
+          "forward_seconds": 0.28237011982128024,
+          "backward_seconds": 0.2127988305874169,
+          "optimizer_and_ema_seconds": 0.0430968520231545,
+          "step_seconds": 0.5719522689469159,
+          "loss": 1.7392578125
+        },
+        {
+          "data_wait_seconds": 0.008639202918857336,
+          "forward_seconds": 0.20366843696683645,
+          "backward_seconds": 0.15138047095388174,
+          "optimizer_and_ema_seconds": 0.01997717097401619,
+          "step_seconds": 0.408215775154531,
+          "loss": 0.00045371055603027344
+        },
+        {
+          "data_wait_seconds": 0.009830725379288197,
+          "forward_seconds": 0.2113542058505118,
+          "backward_seconds": 0.1526797041296959,
+          "optimizer_and_ema_seconds": 0.01983959088101983,
+          "step_seconds": 0.4190711132250726,
+          "loss": 0.00021058320999145508
+        }
+      ],
+      "step_p50_seconds": 0.4136434441898018,
+      "throughput_local_examples_per_second": 9.670164138186088,
+      "cuda_peak": {
+        "allocated_bytes": 5790803968,
+        "reserved_bytes": 6134169600
+      }
+    },
+    {
+      "variant": "p2n_state_gate_new",
+      "rank": 1,
+      "self_past_probability": 0.0,
+      "context_tokens": 15,
+      "observation_tokens": 2,
+      "crop_shape": [
+        112,
+        112
+      ],
+      "cnn_trainable": true,
+      "batch_per_rank": 2,
+      "accumulation": 2,
+      "ar": "production_16x768",
+      "oat": "tiny_real_fsq",
+      "precision": "bf16",
+      "successful_optimizer_updates": 4,
+      "all_trainable_gradients_finite": true,
+      "exact_rng_continuation": true,
+      "strict_resume_matches_uninterrupted": true,
+      "measurements": [
+        {
+          "data_wait_seconds": 0.009775725193321705,
+          "forward_seconds": 0.21540540689602494,
+          "backward_seconds": 0.2572894161567092,
+          "optimizer_and_ema_seconds": 0.11908052815124393,
+          "step_seconds": 0.6284307446330786,
+          "loss": 1.75341796875
+        },
+        {
+          "data_wait_seconds": 0.00912535423412919,
+          "forward_seconds": 0.11017418513074517,
+          "backward_seconds": 0.15593921206891537,
+          "optimizer_and_ema_seconds": 0.027827091980725527,
+          "step_seconds": 0.3296070620417595,
+          "loss": 0.0005497932434082031
+        },
+        {
+          "data_wait_seconds": 0.01061317790299654,
+          "forward_seconds": 0.09753554221242666,
+          "backward_seconds": 0.1562921036966145,
+          "optimizer_and_ema_seconds": 0.02022229228168726,
+          "step_seconds": 0.31198090594261885,
+          "loss": 0.00030517578125
+        }
+      ],
+      "step_p50_seconds": 0.32079398399218917,
+      "throughput_local_examples_per_second": 12.469061764254887,
+      "cuda_peak": {
+        "allocated_bytes": 5631740928,
+        "reserved_bytes": 5951717376
+      }
+    },
+    {
+      "variant": "p2n_state_gate_new",
+      "rank": 1,
+      "self_past_probability": 0.5,
+      "context_tokens": 15,
+      "observation_tokens": 2,
+      "crop_shape": [
+        112,
+        112
+      ],
+      "cnn_trainable": true,
+      "batch_per_rank": 2,
+      "accumulation": 2,
+      "ar": "production_16x768",
+      "oat": "tiny_real_fsq",
+      "precision": "bf16",
+      "successful_optimizer_updates": 4,
+      "all_trainable_gradients_finite": true,
+      "exact_rng_continuation": true,
+      "strict_resume_matches_uninterrupted": true,
+      "measurements": [
+        {
+          "data_wait_seconds": 0.009382834192365408,
+          "forward_seconds": 0.24362029088661075,
+          "backward_seconds": 0.23994457069784403,
+          "optimizer_and_ema_seconds": 0.04293722100555897,
+          "step_seconds": 0.5636488078162074,
+          "loss": 2.04736328125
+        },
+        {
+          "data_wait_seconds": 0.009975275956094265,
+          "forward_seconds": 0.20691986521705985,
+          "backward_seconds": 0.1539746979251504,
+          "optimizer_and_ema_seconds": 0.030312898103147745,
+          "step_seconds": 0.4285324881784618,
+          "loss": 0.0005716085433959961
+        },
+        {
+          "data_wait_seconds": 0.0099568460136652,
+          "forward_seconds": 0.2152300956659019,
+          "backward_seconds": 0.15544565301388502,
+          "optimizer_and_ema_seconds": 0.020236403215676546,
+          "step_seconds": 0.43142753606662154,
+          "loss": 0.00024622678756713867
+        }
+      ],
+      "step_p50_seconds": 0.42998001212254167,
+      "throughput_local_examples_per_second": 9.302758005551254,
+      "cuda_peak": {
+        "allocated_bytes": 5540223488,
+        "reserved_bytes": 5857345536
+      }
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+# Tested original ResNet18 / SpatialSoftmax recipe dependencies.
+# Install into a separate prepared environment if needed; the existing /venv/oat works.
+robomimic==0.2.0
+torchvision==0.25.0
+torch==2.10.0

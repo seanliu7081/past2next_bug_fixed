@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+- /train_p2n_new_original_obs
+- _self_
+name: train_p2n_new_original_obs_libero
+variant: p2n_new
+task_type: libero
+task:
+  policy:
+    lazy_eval: false
