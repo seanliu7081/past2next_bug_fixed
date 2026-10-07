@@ -1,0 +1,19 @@
+# Same-stack PI0.5 baseline: identical VLM, LoRA, prompt, OAT-KI and stop-gradient as P2N-VLA, but the
+# expert keeps pi05_base's unfolded adaRMS flow-matching head (horizon 16, execute 8, 10 Euler steps)
+# and takes no past commands. Tests the head replacement itself.
+defaults:
+  - train_p2n_vla
+  - _self_
+
+name: train_pi05_ki_flow
+variant: pi05_ki_flow
+
+policy:
+  _target_: oat.policy.pi05_ki_flow.PI05KIFlowPolicy
+  use_past: false                  # the flow head has no past conditioning (the class rejects true)
+  self_past_p: 0.0                 # no self-past without a past input (forced by the class as well)
+  flow_num_steps: 10               # Euler steps at inference
+  flow_time_beta: [1.5, 1.0]       # PI0.5 flow-matching time distribution Beta(1.5, 1)
+
+training:
+  validate_generated_history: false

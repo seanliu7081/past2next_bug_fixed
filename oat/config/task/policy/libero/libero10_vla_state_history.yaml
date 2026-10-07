@@ -1,0 +1,109 @@
+# P2N-VLA LIBERO-10 task (p2n_vla_state_gate): libero10_vla.yaml plus measured state history
+# (8 states [t-7..t] per key, contiguous-suffix validity) for the dataset and the rollout runner.
+# Used as `defaults: [task/policy: libero/libero10_vla_state_history]`; it expects the top-level keys
+# n_obs_steps (1 for the VLA), horizon (16), n_action_steps (8 executed), past_n (7) and training.num_demo.
+name: libero10
+
+task_name: libero10
+lazy_eval: true
+task_uids: [30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
+
+shape_meta:
+  obs:
+    agentview_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eye_in_hand_rgb:
+      shape: [128, 128, 3]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+      type: state
+    robot0_eef_quat:
+      shape: [4]
+      type: state
+    robot0_gripper_qpos:
+      shape: [2]
+      type: state
+    task_uid:
+      shape: [1]
+      type: state
+  action:
+    shape: [7]
+
+# Cameras fed to SigLIP (in this order); wrist cameras get colour jitter only (openpi).
+rgb_ports: [agentview_rgb, robot0_eye_in_hand_rgb]
+wrist_ports: [robot0_eye_in_hand_rgb]
+
+# pi05 discrete state in the prompt (openpi LIBERO): eef_pos(3) + axis-angle(eef_quat)(3) + gripper_qpos(2).
+# The dataset fits its train-split q01/q99 as the 'prompt_state' normalizer field.
+prompt_state:
+  keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
+  transforms:
+    robot0_eef_pos: identity
+    robot0_eef_quat: quat_to_axis_angle
+    robot0_gripper_qpos: identity
+
+# Policy-side prompt block (P2NVLACommonPolicy `prompt=`): the language comes from task_uid 30..39,
+# never from the truncated zarr 'prompt' field.
+prompt:
+  instruction_source: libero10
+  state_keys: ${..prompt_state.keys}
+  state_transforms: ${..prompt_state.transforms}
+  max_len: 96
+  dummy_uid: 30
+
+# Measured state history (single source for the dataset and the runner; the policy should use the same).
+# Must equal past_n + 1. Quaternion keys select the quaternion history encoder.
+state_history_steps: 8
+state_history_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
+
+env_runner:
+  _target_: oat.env_runner.p2n_new_runner.P2NStateGateNewLiberoRunner
+  task_name: libero10
+  protocol: corrected
+  n_test: 100
+  n_test_vis: 0
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 20
+  n_parallel_envs: 10
+  image_size: 128
+  camera_names:
+    - agentview
+    - robot0_eye_in_hand
+  state_ports:
+    - robot0_eef_pos
+    - robot0_eef_quat
+    - robot0_gripper_qpos
+  max_episode_steps: 550
+  state_history_steps: ${..state_history_steps}
+  state_history_keys: ${..state_history_keys}
+
+dataset:
+  _target_: oat.dataset.vla_dataset.VLAZarrDatasetWithStateHistory
+  # Absolute path: the frozen OAT tokenizer records this exact path (preflight compares it).
+  zarr_path: /workspace/past_action/data/libero/libero10_N${training.num_demo}.zarr
+  obs_keys:
+    - agentview_rgb
+    - robot0_eye_in_hand_rgb
+    - robot0_eef_pos
+    - robot0_eef_quat
+    - robot0_gripper_qpos
+    - task_uid
+  action_key: action
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${horizon}
+  # Split seed pinned to the frozen OAT tokenizer's split (val_ratio 0.1, seed 42), independent of the
+  # training seed.
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  past_n: ${past_n}
+  # Actions executed per chunk at rollout (the policy's n_action_steps), not the chunk length.
+  n_exec_steps: ${n_action_steps}
+  history_padding: zero
+  return_history_validity: true
+  state_history_steps: ${..state_history_steps}
+  state_history_keys: ${..state_history_keys}
+  prompt_state: ${..prompt_state}

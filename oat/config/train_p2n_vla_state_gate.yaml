@@ -1,0 +1,25 @@
+# P2N-VLA + measured state history: 8 states [t-7..t] -> 4 HIST summaries read by the AR rows through a
+# learned log-gate (fp32 additive bias). Same recipe as train_p2n_vla.yaml; only the gate/history modules,
+# the state-history task config and the gate runner differ (mirrors train_p2n_state_gate_new.yaml).
+defaults:
+  - train_p2n_vla
+  - override task/policy: libero/libero10_vla_state_history
+  - _self_
+
+name: train_p2n_vla_state_gate
+variant: p2n_vla_state_gate
+
+policy:
+  _target_: oat.policy.p2n_vla_state_gate.P2NVLAStateGatePolicy
+  state_history_steps: ${task.policy.state_history_steps}   # past_n + 1
+  state_history_keys: ${task.policy.state_history_keys}
+  history_embed_dim: 128
+  history_n_heads: 4
+  history_n_layers: 2
+  history_summary_tokens: 4
+  history_dropout: 0.1
+  history_gate_mode: learned       # learned | open (frozen gate+pool) | closed (also frozen HIST path)
+  history_gate_hidden_dim: 128
+  history_gate_init: 0.9           # last layer zero-init, bias logit(0.9)
+  rotation_6d_layout: rows
+  gate_state_dim: 256              # Linear(prompt-state -> 256) inside the observation pool

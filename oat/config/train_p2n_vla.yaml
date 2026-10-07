@@ -1,0 +1,147 @@
+# P2N-VLA on LIBERO-10: PaliGemma (SigLIP frozen + Gemma-2B LoRA r16) with the pi05_base Gemma-300M
+# expert as a Past2Next autoregressive head over 8 SO(3)-augmented OAT tokens, OAT knowledge insulation
+# on the VLM, and self-past training. This file is the single home of the training recipe
+# (plan: "Training recipe"); the task config owns the data/prompt/runner schema.
+# Launch with `bash train_p2n_vla.sh --variant p2n_vla --task libero ...` (see docs/P2N_VLA.md).
+defaults:
+  - task/policy: libero/libero10_vla
+  - _self_
+
+name: train_p2n_vla
+policy_family: p2n_vla
+variant: p2n_vla
+task_type: libero
+_target_: oat.workspace.train_p2n_vla.TrainP2NVLAWorkspace
+seed: 42
+horizon: 16              # OAT chunk: 16 x 7 actions <-> 8 FSQ tokens
+n_action_steps: 8        # executed per chunk
+n_obs_steps: 1           # current frame only (prev_obs is t-8 for self-past)
+past_n: 7                # past commands a_{t-7..t-1}
+max_prompt_len: 96       # "Task: ..., State: <8 bins>;\nAction: " right-padded; preflight checks the worst case
+task_name: ${task.policy.name}
+shape_meta: ${task.policy.shape_meta}
+
+policy:
+  _target_: oat.policy.p2n_vla.P2NVLAPolicy
+  variant: ${variant}
+  task: ${task_type}
+  shape_meta: ${shape_meta}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  past_n: ${past_n}
+  horizon: ${horizon}
+  construction_mode: fresh
+  model_size: full
+  # Pinned assets from data/pretrained/p2n_vla/assets.json (lerobot/pi05_base@b211f3d4, big_vision SPM)
+  # and the LIBERO SO(3)-aug OAT (left_noise, EMA). --pi05/--spm/--tokenizer override the paths.
+  pi05_weights: /workspace/.hf_home/hub/models--lerobot--pi05_base/snapshots/b211f3d44c36b6acfcf7ae94a64e8e96f75a64ba/model.safetensors
+  pi05_sha256: 0eb11ca9587678c1d2ef8cf32807c29f8ce53a2bfdfc1aa4a4c96f16fca59b0f
+  spm_path: /workspace/past2next_bug_fixed/data/pretrained/p2n_vla/paligemma_tokenizer.model
+  spm_sha256: 8986bb4f423f07f8c7f70d0dbe3526fb2316056c17bae71b1ea975e77a168fc6
+  tokenizer_checkpoint: /workspace/hf_upload/tokenizer_oattok_so3aug_ep4960_mse0.001.ckpt
+  rgb_ports: ${task.policy.rgb_ports}
+  wrist_ports: ${task.policy.wrist_ports}
+  train_image_aug: true
+  prompt: ${task.policy.prompt}
+  lora_rank: 16
+  lora_alpha: 16.0
+  lambda_ki: 1.0           # L = L_AR + lambda_ki * L_KI; 0 freezes LoRA + KI table ("frozen VLM")
+  ki_skip: 1152            # KI rows = PaliGemma rows 255999 - t (keeps <loc>/<seg> intact)
+  use_past: true
+  adarms_t0: 0.6           # adaRMS folded at c0 = time_mlp(sincos(t0))
+  temperature: 0.0         # deploy: greedy decoding
+  topk: 10
+  activation_checkpointing: true
+  frozen_dtype: null       # bf16 frozen backbone for model_size=full, fp32 for tiny
+  self_past_p: 0.5
+  self_past_warmup_steps: 1000
+  self_past_ramp_steps: 4000
+  self_past_chunk_size: 4
+  self_past_temperature: 1.0
+  self_past_topk: 10
+  self_past_schedule: optimizer_step
+
+training:
+  resume: false
+  resume_checkpoint: null
+  init_checkpoint: null
+  seed: ${seed}
+  num_demo: 500                    # LIBERO-10 episodes in the zarr (the task config's path uses it)
+  # Length: 8 epochs x 7500 micro-batches per rank / accumulation 2 = 30000 updates
+  # at micro-batch 8 per GPU x 2 GPUs x accumulation 2 = 32 samples per update.
+  num_epochs: 8
+  max_train_steps: 7500            # micro-batches per rank per epoch
+  max_optimizer_steps: 30000       # hard stop and cosine horizon
+  gradient_accumulate_every: 2
+  lr_warmup_steps: 1000            # linear warmup from peak/(W+1), then cosine
+  min_lr_ratio: 0.1                # cosine floor as a fraction of each group's peak LR
+  max_grad_norm: 1.0               # applied separately to each clip group ('ar', 'ki')
+  use_ema: true
+  val_every: 1                     # epochs; EMA weights, expert + generated history, all ranks
+  max_val_steps: 200               # validation batches per rank
+  max_reconst_steps: 200           # stateless predict_action reconstruction batches per rank
+  validate_generated_history: true
+  offline_validation_enabled: true
+  offline_validation_reason: held_out_libero_episodes
+  checkpoint_every: 1              # epochs: checkpoints/latest.ckpt (resume payload)
+  snapshot_every: 5000             # optimizer steps: snapshots/upd-NNNNNN_ema.ckpt (bf16 EMA artifact)
+  keep_resume_checkpoint: false    # delete latest.ckpt after the final snapshot
+  log_every: 1                     # optimizer steps between logs.jsonl / W&B step records
+  max_consecutive_skipped_updates: 20
+  tqdm_interval_sec: 1.0
+  probe:                           # train_p2n_vla.sh --probe (memory/throughput go/no-go)
+    enabled: false
+    optimizer_steps: 3
+    self_past_step: null           # null -> warmup + ramp steps, i.e. p = self_past_p (0.5); 0 -> p = 0
+    worst_case_pass: true          # one extra forward/backward at history_mode=generated (p = 1)
+    validation_batches: 1
+    max_reserved_gb: 22.5
+    min_headroom_gb: 2.0
+
+ema:
+  decay: 0.999
+  warmup_power: null               # constant decay from the first update
+
+optimizer:
+  policy_lr: 5.0e-5                # 'pretrained' group: expert (+ folded modulations) and LoRA
+  new_module_lr: 1.0e-4            # 'new' group: KI table, tok_emb, RAW/ACC/JERK, history/gate modules
+  weight_decay: 1.0e-10
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  fused: null                      # fused AdamW iff every trainable parameter is on CUDA
+
+dataloader:
+  batch_size: 8                    # micro-batch per GPU
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  drop_last: true
+
+val_dataloader:
+  batch_size: 8
+  num_workers: 2
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+  drop_last: false
+
+task:
+  policy:
+    prompt:
+      max_len: ${max_prompt_len}
+
+logging:
+  project: p2n_vla
+  resume: false
+  mode: offline                    # online | offline | disabled
+  name: ${now:%Y%m%d.%H%M%S}_${variant}_${task_name}_seed${seed}
+  tags: ['${variant}', '${task_name}', 'pi05_base', 'oat_so3aug']
+  id: null
+  group: ${variant}_${task_type}
+
+hydra:
+  run:
+    dir: output/training/${variant}_${task_type}_${now:%Y%m%d_%H%M%S}_seed${seed}
+  job:
+    chdir: false
