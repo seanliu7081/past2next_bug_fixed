@@ -1391,6 +1391,25 @@ def test_real_tiny_p2n_vla_trains_resumes_and_reloads_exactly(tmp_path):
     assert P2NVLAPolicy.from_checkpoint(str(snapshot), weights="ema").self_past_step == 2
 
 
+@pytest.mark.slow
+def test_real_tiny_resume_on_a_rebuilt_zarr_needs_allow_dataset_change(tmp_path):
+    """A reshuffled rebuild keeps the split ids but not the demos: refused by default, recorded when allowed."""
+    _require_real_policy_stack()
+    original = make_libero_like_zarr(tmp_path / "original.zarr", seed=0)
+    rebuilt = make_libero_like_zarr(tmp_path / "rebuilt.zarr", seed=1)
+    run_workspace(real_tiny_config("p2n_vla", original, "training.num_epochs=1"), tmp_path / "first")
+    resume = ("training.resume=true", f"training.resume_checkpoint={tmp_path / 'first/checkpoints/latest.ckpt'}")
+    with pytest.raises(ValueError, match="allow_dataset_change"):
+        run_workspace(real_tiny_config("p2n_vla", rebuilt, *resume), tmp_path / "refused")
+    resumed = run_workspace(real_tiny_config("p2n_vla", rebuilt, *resume, "training.allow_dataset_change=true"),
+                            tmp_path / "resumed")
+    assert resumed.completed_optimizer_steps == 2
+    [change] = resumed.dataset_split["resume_dataset_changes"]
+    assert change["optimizer_step"] == 1 and change["zarr_path"] == str(rebuilt)
+    assert change["previous_episode_and_action_sha256"] != change["episode_and_action_sha256"]
+    assert json.loads((tmp_path / "resumed/dataset_split.json").read_text())["resume_dataset_changes"] == [change]
+
+
 FRESH_PROCESS_RELOAD = r"""
 import sys
 import torch

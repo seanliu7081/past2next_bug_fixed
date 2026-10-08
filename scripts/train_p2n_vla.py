@@ -432,6 +432,19 @@ def check_prompts(cfg):
             "per_uid": {str(uid): length for uid, length in lengths.items()}}
 
 
+def dataset_identity_sha256(cfg):
+    """The workspace's resume identity digest (episode_ends + actions), read straight from the zarr."""
+    import hashlib
+    import numpy as np
+    import zarr
+    dataset = cfg.task.policy.dataset
+    root = zarr.open(str(dataset.zarr_path), mode="r")
+    digest = hashlib.sha256()
+    digest.update(np.asarray(root["meta/episode_ends"][:]).tobytes())
+    digest.update(np.asarray(root["data"][dataset.action_key][:]).tobytes())
+    return digest.hexdigest()
+
+
 def check_resume(cfg, world_size, split):
     from oat.workspace.train_p2n_vla import TrainP2NVLAWorkspace
     path = Path(cfg.training.resume_checkpoint)
@@ -441,9 +454,23 @@ def check_resume(cfg, world_size, split):
     for key in ("train_episode_ids", "validation_episode_ids"):
         if saved.get(key) != split.get(key):
             raise ValueError(f"Resume {key} differ from the current dataset split")
+    warnings = []
+    # Episode ids alone miss a rebuilt zarr (merge_data.py --shuffle is unseeded): same ids, other demos.
+    if saved.get("episode_and_action_sha256"):
+        digest = dataset_identity_sha256(cfg)
+        if digest != saved["episode_and_action_sha256"]:
+            message = (f"Resume dataset content differs from the checkpoint: "
+                       f"{cfg.task.policy.dataset.zarr_path} has episode_and_action_sha256={digest}, "
+                       f"the checkpoint expects {saved['episode_and_action_sha256']}")
+            if not cfg.training.get("allow_dataset_change"):
+                raise ValueError(f"{message}. A rebuilt zarr orders episodes differently, so the same split ids "
+                                 "hold out other demos. Pass the run's original zarr with "
+                                 "-- task.policy.dataset.zarr_path=<path>, or knowingly continue on this one "
+                                 "with -- training.allow_dataset_change=true")
+            warnings.append(f"{message}; continuing because training.allow_dataset_change=true (the held-out "
+                            "validation demos change, so offline validation is not comparable across the resume)")
     counters = payload["training"]["counters"]
     original = payload.get("cfg") or {}
-    warnings = []
     for label, saved_value, value in (
             ("task.policy.lazy_eval", ((original.get("task") or {}).get("policy") or {}).get("lazy_eval"),
              cfg.task.policy.get("lazy_eval")),

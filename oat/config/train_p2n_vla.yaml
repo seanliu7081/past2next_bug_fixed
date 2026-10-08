@@ -99,6 +99,8 @@ training:
   rollout_timeout_minutes: 100     # watchdog: a rollout still running after this kills its simulators and fails
                                    # (a hung simulator); must stay below the 2 h process-group timeout
   keep_resume_checkpoint: false    # delete latest.ckpt after the final snapshot
+  allow_dataset_change: false      # resume only: accept a zarr whose content sha256 differs from the checkpoint's
+                                   # (same split ids, e.g. a reshuffled rebuild); recorded in dataset_split.json
   log_every: 1                     # optimizer steps between logs.jsonl / W&B step records
   max_consecutive_skipped_updates: 20
   tqdm_interval_sec: 1.0

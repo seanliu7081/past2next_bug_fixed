@@ -605,9 +605,11 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                 raise ValueError(f"Resume schema mismatch: {key}")
         new_data, old_data = _plain(cfg.task.policy.dataset), _plain(saved.task.policy.dataset)
         for key in sorted(set(new_data) | set(old_data)):
+            if key == "zarr_path":
+                # A location, like the asset paths: the zarr may move between machines. run() (and the
+                # launcher's preflight) compare the content sha256 against training.dataset_split instead.
+                continue
             a, b = new_data.get(key), old_data.get(key)
-            if key == "zarr_path" and a and b:
-                a, b = str(pathlib.Path(a).expanduser().resolve()), str(pathlib.Path(b).expanduser().resolve())
             if a != b:
                 raise ValueError(f"Resume data schema/split mismatch: dataset.{key}")
         for section in ("ema", "optimizer"):
@@ -1524,9 +1526,27 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
             dataset, val_dataset, training, train_loader, val_loader)
         split["validation"]["evaluated_windows"] = int(val_windows)
         if payload is not None:
-            saved_identity = (payload["training"]["dataset_split"] or {}).get("identity")
-            if saved_identity != split.get("identity"):
-                raise ValueError("Resume dataset identity or episode split differs from the checkpoint")
+            saved_split = payload["training"]["dataset_split"] or {}
+            saved_identity, identity = saved_split.get("identity") or {}, split.get("identity") or {}
+            changes = list(saved_split.get("resume_dataset_changes") or [])
+            if saved_identity != identity:
+                key = "episode_and_action_sha256"
+                message = (f"Resume dataset identity or episode split differs from the checkpoint: "
+                           f"{cfg.task.policy.dataset.zarr_path} has {key}={identity.get(key)}, "
+                           f"the checkpoint expects {saved_identity.get(key)}")
+                same_split = all(saved_identity.get(name) == identity.get(name)
+                                 for name in ("train_episode_ids", "validation_episode_ids"))
+                if not (same_split and training.get("allow_dataset_change")):
+                    raise ValueError(f"{message} (merge_data.py --shuffle is unseeded, so a rebuilt zarr orders "
+                                     "episodes differently; use the run's original zarr, or with identical split "
+                                     "ids knowingly continue via training.allow_dataset_change=true)")
+                accelerator.print(f"WARNING: {message}; continuing because training.allow_dataset_change=true. "
+                                  "The held-out validation demos change from here on.")
+                changes.append({"optimizer_step": int(payload["training"]["counters"]["completed_optimizer_steps"]),
+                                "zarr_path": str(cfg.task.policy.dataset.zarr_path),
+                                f"previous_{key}": saved_identity.get(key), key: identity.get(key)})
+            if changes:  # carried into every later checkpoint and dataset_split.json
+                split["resume_dataset_changes"] = changes
         self.dataset_split = split
         validation_enabled = bool(split["offline_validation_enabled"])
 
