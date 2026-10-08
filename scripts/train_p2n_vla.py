@@ -6,11 +6,15 @@ Modes (mutually exclusive):
   --preflight  dataset schema/split, OAT provenance, asset sha256s, prompt lengths, CPU model build
                and parameter counts; trains nothing
   --probe      short torchrun probe: N optimizer steps with self-past at its full probability, one
-               worst-case history_mode='generated' pass and a validation pass; writes probe.json
-               (memory, samples/s, go/no-go)
+               worst-case history_mode='generated' pass, a validation pass and, with
+               task.policy.lazy_eval=false, a short official rollout on rank 0; writes probe.json
+               (memory incl. the EGL renderers, samples/s, go/no-go)
   (none)       light preflight (no model build), then torchrun training
 
 Everything after ``--`` is passed to Hydra as overrides, e.g. ``-- training.num_epochs=1``.
+In-training official LIBERO-10 evaluation every 50 epochs (100-update epochs) with live W&B:
+  bash train_p2n_vla.sh --variant p2n_vla --task libero --devices 0,1 --output output/training/p2n_vla_libero10_s42 \
+      -- task.policy.lazy_eval=false logging.mode=online
 """
 from __future__ import annotations
 
@@ -140,8 +144,11 @@ def validate_config(cfg, variant, task):
         raise ValueError(f"{variant} must be evaluated by {RUNNER_TARGETS[gate]}")
     if runner.get("protocol") not in ("corrected", "official"):
         raise ValueError("The P2N runners support the corrected and official protocols only")
-    if cfg.task.policy.get("lazy_eval") is not True:
-        raise ValueError("No in-training rollouts: set task.policy.lazy_eval=true and use scripts/evaluate_p2n_vla.py")
+    lazy_eval = cfg.task.policy.get("lazy_eval")
+    if not isinstance(lazy_eval, bool):
+        raise ValueError("task.policy.lazy_eval must be true (no rollouts) or false (in-training rollouts)")
+    if not lazy_eval:
+        validate_rollout(cfg)
     history = sorted(key for key in policy if str(key).startswith(("history_", "state_history")))
     if not gate and history:
         raise ValueError(f"{variant} must not construct history/gate modules: {history}")
@@ -198,6 +205,93 @@ def validate_config(cfg, variant, task):
         raise ValueError("logging.mode must be online, offline or disabled")
 
 
+LIBERO_OFFICIAL_INIT_STATES = 50  # fixed initial states per task in LIBERO's init_states files
+
+
+def validate_rollout(cfg):
+    """In-training rollouts (lazy_eval=false): cadence and a schedule the official protocol can serve."""
+    training, runner = cfg.training, cfg.task.policy.env_runner
+    _int(training.get("rollout_every"), "training.rollout_every")
+    if not isinstance(training.get("rollout_at_final", True), bool):
+        raise ValueError("training.rollout_at_final must be a boolean")
+    _int(training.get("rollout_seed", 44), "training.rollout_seed", minimum=0)
+    if training.get("rollout_failure", "continue") not in ("continue", "raise"):
+        raise ValueError("training.rollout_failure must be continue or raise")
+    if training.get("max_train_steps") is None:
+        raise ValueError("In-training rollouts need training.max_train_steps (a fixed number of updates per epoch), "
+                         "so that rollout_every epochs is a known number of updates")
+    timeout = float(training.get("rollout_timeout_minutes", 100))
+    if not 0 < timeout < 120:
+        raise ValueError("training.rollout_timeout_minutes must lie in (0, 120): the other rank waits in a barrier "
+                         "bounded by the 2 h process-group timeout")
+    n_test = _int(runner.get("n_test"), "task.policy.env_runner.n_test")
+    _int(runner.get("n_parallel_envs"), "task.policy.env_runner.n_parallel_envs")
+    _int(runner.get("max_episode_steps"), "task.policy.env_runner.max_episode_steps")
+    _int(runner.get("test_start_seed", 1000), "task.policy.env_runner.test_start_seed", minimum=0)
+    offset = _int(runner.get("init_state_offset", 0), "task.policy.env_runner.init_state_offset", minimum=0)
+    vis = runner.get("n_test_vis", 0)
+    if isinstance(vis, bool) or not isinstance(vis, int) or not 0 <= vis <= n_test:
+        raise ValueError("task.policy.env_runner.n_test_vis must lie in [0, n_test]")
+    if runner.get("protocol") == "official":
+        tasks = len(list(cfg.task.policy.get("task_uids") or [])) or 10
+        if n_test % tasks:
+            raise ValueError(f"Official rollouts must be balanced: n_test={n_test} is not a multiple of {tasks} tasks")
+        if offset + n_test // tasks > LIBERO_OFFICIAL_INIT_STATES:
+            raise ValueError(f"Official rollouts need init_state_offset + n_test/{tasks} <= "
+                             f"{LIBERO_OFFICIAL_INIT_STATES} initial states per task")
+    elif offset:
+        raise ValueError("init_state_offset applies to the official protocol only")
+    _int(training.get("probe", {}).get("rollout_episodes", 0) or 0, "training.probe.rollout_episodes", minimum=0)
+    expected = rollout_minutes(cfg)
+    if expected > 0.8 * timeout:
+        raise ValueError(f"One evaluation needs about {expected:.0f} min ({math.ceil(n_test / int(runner.n_parallel_envs))} "
+                         f"chunks of {int(runner.n_parallel_envs)} episodes), too close to "
+                         f"training.rollout_timeout_minutes={timeout:g}: raise n_parallel_envs or lower n_test")
+    if not rollout_plan(cfg)["rollouts"]:
+        raise ValueError("No in-training rollout would run: training.rollout_every exceeds the epochs trained and "
+                         "training.rollout_at_final is false")
+
+
+SECONDS_PER_CHUNK = 47.0  # measured: one chunk of parallel episodes at max_episode_steps=550 (RTX 4090)
+
+
+def rollout_minutes(cfg):
+    """Expected wall time of one in-training evaluation (chunks run until their slowest episode ends)."""
+    runner = cfg.task.policy.env_runner
+    chunks = math.ceil(int(runner.n_test) / int(runner.n_parallel_envs))
+    return chunks * SECONDS_PER_CHUNK * int(runner.max_episode_steps) / 550.0 / 60.0
+
+
+def rollout_plan(cfg):
+    """When the in-training rollouts happen (1-indexed epochs and the update count at each)."""
+    if cfg.task.policy.get("lazy_eval", True):
+        return {"enabled": False}
+    training, runner = cfg.training, cfg.task.policy.env_runner
+    every, epochs = int(training.rollout_every), int(training.num_epochs)
+    cap, accumulation = training.get("max_train_steps"), int(training.gradient_accumulate_every)
+    per_epoch = math.ceil(int(cap) / accumulation) if cap is not None else None
+    limit = training.get("max_optimizer_steps")
+    last = epochs  # max_optimizer_steps can end training before num_epochs
+    if per_epoch is not None and limit is not None:
+        last = min(epochs, max(1, math.ceil(int(limit) / per_epoch)))
+    planned = list(range(every, last + 1, every))
+    if training.get("rollout_at_final", True) and (not planned or planned[-1] != last):
+        planned.append(last)
+    points = [{"epoch": epoch, "optimizer_step": None if per_epoch is None else
+               (epoch * per_epoch if limit is None else min(epoch * per_epoch, int(limit)))} for epoch in planned]
+    tasks = len(list(cfg.task.policy.get("task_uids") or [])) or 10
+    return {"enabled": True, "every_epochs": every, "rollouts": points, "protocol": runner.protocol,
+            "n_test": int(runner.n_test), "episodes_per_task": int(runner.n_test) // tasks,
+            "episode_seeds": [int(runner.get("test_start_seed", 1000)),
+                              int(runner.get("test_start_seed", 1000)) + int(runner.n_test) - 1],
+            "init_state_offset": int(runner.get("init_state_offset", 0)),
+            "n_parallel_envs": int(runner.n_parallel_envs), "max_episode_steps": int(runner.max_episode_steps),
+            "expected_minutes_per_rollout": round(rollout_minutes(cfg), 1),
+            "timeout_minutes": float(training.get("rollout_timeout_minutes", 100)),
+            "failure_policy": str(training.get("rollout_failure", "continue")),
+            "weights": "ema" if training.use_ema else "model", "precision": "bf16 (= snapshot)", "rank": 0}
+
+
 def expected_schedule(cfg, train_windows=None, world_size=2):
     """Update arithmetic; exact when the number of training windows is known."""
     from oat.common.p2n_new_capabilities import resolve_update_schedule
@@ -247,7 +341,8 @@ def describe(cfg, world_size, output, mode):
             "schedule": expected_schedule(cfg, None, world_size),
             "assets": {key: policy.get(key) for key in ("pi05_weights", "pi05_sha256", "spm_path", "spm_sha256",
                                                         "tokenizer_checkpoint")},
-            "dataset": cfg.task.policy.dataset.zarr_path, "logging_mode": cfg.logging.mode}
+            "dataset": cfg.task.policy.dataset.zarr_path, "logging_mode": cfg.logging.mode,
+            "rollout": rollout_plan(cfg)}
 
 
 # ------------------------------------------------------------------------------- preflight
@@ -347,8 +442,28 @@ def check_resume(cfg, world_size, split):
         if saved.get(key) != split.get(key):
             raise ValueError(f"Resume {key} differ from the current dataset split")
     counters = payload["training"]["counters"]
+    original = payload.get("cfg") or {}
+    warnings = []
+    for label, saved_value, value in (
+            ("task.policy.lazy_eval", ((original.get("task") or {}).get("policy") or {}).get("lazy_eval"),
+             cfg.task.policy.get("lazy_eval")),
+            ("training.rollout_every", (original.get("training") or {}).get("rollout_every"),
+             cfg.training.get("rollout_every")),
+            ("logging.mode", (original.get("logging") or {}).get("mode"), cfg.logging.get("mode")),
+            ("training.rollout_failure", (original.get("training") or {}).get("rollout_failure"),
+             cfg.training.get("rollout_failure")),
+            *[(f"task.policy.env_runner.{key}",
+               (((original.get("task") or {}).get("policy") or {}).get("env_runner") or {}).get(key),
+               cfg.task.policy.env_runner.get(key))
+              for key in ("protocol", "n_test", "test_start_seed", "init_state_offset", "max_episode_steps",
+                          "n_parallel_envs")]):
+        if saved_value is not None and saved_value != value:
+            warnings.append(f"{label} was {saved_value!r} in the original run but is {value!r} now "
+                            f"(pass -- {label}={saved_value} to keep it)")
+    for warning in warnings:
+        print(f"WARNING (resume): {warning}", file=sys.stderr, flush=True)
     return {"checkpoint": str(path.resolve()), "counters": counters,
-            "world_size": payload["training"]["world_size"]}
+            "world_size": payload["training"]["world_size"], "warnings": warnings}
 
 
 def model_report(cfg):
@@ -408,6 +523,53 @@ def model_report(cfg):
     return report
 
 
+def check_rollout(cfg):
+    """EGL rendering is usable and every GPU has a CUDA-identified renderer (in-training rollouts only)."""
+    if cfg.task.policy.get("lazy_eval", True):
+        return {"enabled": False}
+    backend = os.environ.get("MUJOCO_GL", "egl").lower().strip()
+    if backend != "egl":
+        return {"enabled": True, "mujoco_gl": backend, "note": "non-EGL rendering: simulators use the CPU"}
+    from oat.env_runner.p2n_vla_rollout import probe_egl_renderers
+    try:
+        renderers = probe_egl_renderers()
+    except (subprocess.CalledProcessError, OSError, ValueError) as error:
+        detail = getattr(error, "stderr", "") or str(error)
+        raise RuntimeError("In-training rollouts need EGL rendering, but the EGL device probe failed "
+                           f"(try install-display-drivers): {detail[-2000:]}") from error
+    return {"enabled": True, "mujoco_gl": backend, "plan": rollout_plan(cfg), "egl_renderers": renderers}
+
+
+def check_wandb(cfg):
+    """logging.mode=online needs credentials (WANDB_API_KEY or `wandb login`'s ~/.netrc entry)."""
+    mode = cfg.logging.get("mode")
+    if mode != "online":
+        return {"mode": mode}
+    for variable in ("WANDB_API_KEY", "WANDB_IDENTITY_TOKEN_FILE"):
+        if os.environ.get(variable):
+            return {"mode": mode, "credentials": variable}
+    base_url = os.environ.get("WANDB_BASE_URL") or "https://api.wandb.ai"
+    try:  # wandb's own resolution ($NETRC, ~ expansion, host:port machine names)
+        from wandb.sdk.lib.wbauth.wbnetrc import read_netrc_auth
+        found = bool(read_netrc_auth(host=base_url))
+        source = "wandb netrc lookup"
+    except ImportError:  # older wandb: the same lookup by hand
+        import netrc
+        from urllib.parse import urlsplit
+        path = os.path.expanduser(os.environ.get("NETRC") or os.path.join("~", ".netrc"))
+        try:
+            found = bool(netrc.netrc(path).authenticators(urlsplit(base_url).netloc))
+        except (OSError, netrc.NetrcParseError):
+            found = False
+        source = path
+    except Exception as error:  # noqa: BLE001 - e.g. a malformed key
+        raise ValueError(f"W&B credentials for {base_url} are unusable: {error}") from error
+    if not found:
+        raise ValueError(f"logging.mode=online needs W&B credentials for {base_url}: run `wandb login` "
+                         "or set WANDB_API_KEY")
+    return {"mode": mode, "credentials": source, "host": base_url, "project": cfg.logging.get("project")}
+
+
 def preflight(cfg, output, world_size=2, *, build_model=False, full_hash=False):
     resume = bool(cfg.training.get("resume"))
     report = {"policy_family": POLICY_FAMILY, "variant": cfg.variant, "task": cfg.task_type,
@@ -420,6 +582,8 @@ def preflight(cfg, output, world_size=2, *, build_model=False, full_hash=False):
     else:
         sources["oat"] = validate_tokenizer_source(cfg)
     sources["prompts"] = check_prompts(cfg)
+    sources["rollout"] = check_rollout(cfg)
+    sources["wandb"] = check_wandb(cfg)
     report["sources"] = sources
     report["schedule"] = expected_schedule(cfg, split["train"]["windows"], world_size)
     if build_model:

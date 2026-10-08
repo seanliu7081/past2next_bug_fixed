@@ -32,7 +32,6 @@ import math
 import os
 from pathlib import Path
 import random
-import subprocess
 import sys
 import time
 import traceback
@@ -44,6 +43,9 @@ sys.path.insert(0, str(ROOT_DIR))
 # Stdlib-only helpers shared with the legacy evaluator (schedule, Wilson summaries, hashing).
 from scripts.evaluate_candidate import (  # noqa: E402
     atomic_json, git_text, official_initial_state_files, sha256, summarize_records)
+# Renderer placement shared with the training workspace's in-training rollouts.
+from oat.env_runner.p2n_vla_rollout import (  # noqa: E402,F401
+    SCOPED_RUNNER_MODULE, close_runner, probe_egl_renderers, resolve_renderer, scope_runner_to_renderer)
 
 CHECKPOINT_FORMAT = "p2n_vla_checkpoint_v1"
 POLICY_TARGETS = {
@@ -52,8 +54,6 @@ POLICY_TARGETS = {
     "oat.policy.pi05_ki_flow.PI05KIFlowPolicy": "pi05_ki_flow",
 }
 RUNNERS = {False: "P2NNewLiberoRunner", True: "P2NStateGateNewLiberoRunner"}
-# Same runner classes, constructed with the simulators bound to one EGL device (P2N_LIBERO_EGL_DEVICE_ID).
-SCOPED_RUNNER_MODULE = "oat.env_runner.p2n_new_convnext_libero10_runner"
 INFERENCE_KEYS = ("temperature", "topk", "use_k_tokens")
 DEFAULT_MAX_EPISODE_STEPS = 550
 
@@ -84,15 +84,16 @@ def parser():
     p.add_argument("--spm", type=Path, help="PaliGemma SentencePiece model (default: the path in the artifact)")
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--threads", type=int, default=4)
-    p.add_argument("--max-episode-steps", type=int, default=DEFAULT_MAX_EPISODE_STEPS,
-                   help="Policy steps per episode, settling excluded")
+    p.add_argument("--max-episode-steps", type=int, default=None,
+                   help="Policy steps per episode, settling excluded (default: the run's own "
+                        "task.policy.env_runner.max_episode_steps, 550 in this repo)")
     p.add_argument("--dry-run", action="store_true",
                    help="Load the policy and write provenance and the schedule without creating simulators")
     return p
 
 
 def validate_args(args):
-    for name in ("n_test", "n_parallel_envs", "threads", "max_episode_steps"):
+    for name in ("n_test", "n_parallel_envs", "threads") + (("max_episode_steps",) if args.max_episode_steps is not None else ()):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if not 0 <= args.n_test_vis <= args.n_test:
@@ -139,7 +140,7 @@ def default_output_dir(args):
         parts.append(f"init{args.init_state_offset}")
     if args.tasks:
         parts.append(f"tasks-{_task_selector_label(args.tasks)}")
-    if args.max_episode_steps != DEFAULT_MAX_EPISODE_STEPS:
+    if args.max_episode_steps is not None and args.max_episode_steps != DEFAULT_MAX_EPISODE_STEPS:
         parts.append(f"steps{args.max_episode_steps}")
     if args.use_k_tokens is not None:
         parts.append(f"k{args.use_k_tokens}")
@@ -303,52 +304,15 @@ def build_runner_config(cfg, policy, args, task_names, output_dir):
     runner.update({
         "n_test": args.n_test, "n_test_vis": args.n_test_vis, "n_parallel_envs": args.n_parallel_envs,
         "test_start_seed": args.episode_start_seed, "n_action_steps": int(policy.n_action_steps),
-        "n_obs_steps": int(policy.n_obs_steps), "max_episode_steps": args.max_episode_steps,
+        "n_obs_steps": int(policy.n_obs_steps),
+        # Default: the run's own budget (task.policy.env_runner.max_episode_steps), so a re-evaluation matches
+        # the in-training rollouts even when training overrode it.
+        "max_episode_steps": (args.max_episode_steps if args.max_episode_steps is not None
+                              else int(runner.get("max_episode_steps") or DEFAULT_MAX_EPISODE_STEPS)),
         "protocol": args.protocol, "task_names": task_names, "init_state_offset": args.init_state_offset,
         "episode_records_path": str(Path(output_dir) / "episodes.jsonl"), "output_dir": str(output_dir),
     })
     return runner
-
-
-def probe_egl_renderers():
-    """EGL devices with their CUDA identity, enumerated in an isolated process without rendering.
-
-    EGL indices need not match CUDA ordinals (on this 2x4090 host they are swapped), so a numeric
-    ``MUJOCO_EGL_DEVICE_ID`` equal to the CUDA index renders on the other GPU.
-    """
-    env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID")
-    env.pop("CUDA_VISIBLE_DEVICES", None)
-    result = subprocess.run([sys.executable, "-m", "oat.common.libero_egl_devices"], cwd=str(ROOT_DIR), env=env,
-                            text=True, capture_output=True, check=True)
-    return json.loads(result.stdout.strip().splitlines()[-1])
-
-
-def resolve_renderer(device, probe=probe_egl_renderers):
-    """The EGL device on the policy's physical GPU, matched by CUDA UUID; None unless rendering with EGL on CUDA."""
-    import torch
-    device = torch.device(device)
-    if os.environ.get("MUJOCO_GL", "egl").lower().strip() != "egl" or device.type != "cuda":
-        return None
-    uuid = str(torch.cuda.get_device_properties(device).uuid).removeprefix("GPU-").lower()
-    matches = [record for record in probe() if str(record["uuid"]).removeprefix("GPU-").lower() == uuid]
-    if len(matches) != 1:
-        raise RuntimeError(f"Cannot identify one EGL renderer for CUDA device {device} (uuid {uuid})")
-    return dict(matches[0])
-
-
-def scope_runner_to_renderer(runner_config, renderer):
-    """Build the simulators on ``renderer``'s EGL device.
-
-    robosuite reads ``MUJOCO_EGL_DEVICE_ID`` per rendering context and asserts at import that it appears in
-    ``CUDA_VISIBLE_DEVICES``; the scoped wrappers set both to the EGL index only while the runner forks its
-    simulators (the policy's CUDA context already exists by then).
-    """
-    if renderer is None:
-        return runner_config
-    os.environ["P2N_LIBERO_EGL_DEVICE_ID"] = str(int(renderer["egl_device_id"]))
-    scoped = dict(runner_config)
-    scoped["_target_"] = f"{SCOPED_RUNNER_MODULE}.{str(runner_config['_target_']).rsplit('.', 1)[1]}"
-    return scoped
 
 
 def source_hashes():
@@ -404,7 +368,7 @@ def main(argv=None):
         # The renderer is resolved from the policy's GPU below; a stale numeric id would only trip
         # robosuite's import-time CUDA_VISIBLE_DEVICES check (the user's value stays in metadata).
         os.environ.pop("MUJOCO_EGL_DEVICE_ID", None)
-    runner = None
+    runner, completed = None, False
     try:
         import hydra
         import torch
@@ -488,6 +452,7 @@ def main(argv=None):
         records = runner.last_episode_records
         if len(records) != args.n_test:
             raise RuntimeError(f"Expected {args.n_test} episode records, received {len(records)}")
+        completed = True
         summary = summarize_records(records)
         summary.update({
             "variant": metadata["variant"], "protocol": args.protocol, "seed": args.seed,
@@ -495,7 +460,7 @@ def main(argv=None):
             "checkpoint_sha256": metadata["checkpoint_sha256"], "weights": args.weights,
             "optimizer_step": metadata["optimizer_step"], "force_gate": args.force_gate,
             "rollout_seconds": rollout_seconds, "episodes_per_second": len(records) / rollout_seconds,
-            "max_episode_steps": args.max_episode_steps, "effective_inference": inference,
+            "max_episode_steps": runner_config["max_episode_steps"], "effective_inference": inference,
             "balanced_schedule": metadata["balanced_schedule"], "all_tasks_covered": metadata["all_tasks_covered"],
         })
         atomic_json(args.output_dir / "summary.json", summary)
@@ -510,7 +475,8 @@ def main(argv=None):
         raise
     finally:
         if runner is not None:
-            runner.close()
+            # Never block on a dead or stuck simulator worker (AsyncVectorEnv.close() would wait forever).
+            close_runner(runner, force=not completed)
 
 
 if __name__ == "__main__":

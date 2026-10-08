@@ -22,8 +22,15 @@ offline-validation split metadata, atomic saves, capability routing). Difference
   per-rank RNG and counters. ``snapshots/upd-NNNNNN_ema.ckpt`` (every
   ``snapshot_every`` optimizer steps and at the end) holds the EMA artifact with
   trainable tensors in bf16 and no training state.
-- No simulator rollouts during training; evaluate snapshots with
-  ``scripts/evaluate_p2n_vla.py``.
+- Simulator rollouts during training only when ``task.policy.lazy_eval=false``: after every
+  ``training.rollout_every`` completed epochs (1-indexed, so 50, 100, ...) and at the final epoch, rank 0
+  evaluates the EMA weights with ``task.policy.env_runner`` (official protocol, 50 episodes per task by
+  default) while the other ranks wait. The schedule equals ``scripts/evaluate_p2n_vla.py``'s, and the
+  simulators render on rank 0's own GPU. Results go to ``eval/rollout_epoch-EEEE_upd-NNNNNN/`` and to a
+  ``{"event": "rollout"}`` record (``rollout/*``) written after the epoch record. The trainables are scored
+  at snapshot precision (bf16), and a snapshot exists for every rollout step. Training RNG streams, live
+  weights and module modes are restored exactly.
+  Otherwise, evaluate snapshots with ``scripts/evaluate_p2n_vla.py``.
 """
 from __future__ import annotations
 
@@ -39,17 +46,22 @@ if __name__ == "__main__":
 import contextlib
 import copy
 from dataclasses import dataclass, field
+import gc
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.metadata
 import json
 import math
+import multiprocessing
 import numbers
 import os
 import pathlib
 import random
 import subprocess
+import sys
+import threading
 import time
+import traceback
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import dill
@@ -66,6 +78,9 @@ from accelerate.utils import DistributedDataParallelKwargs, set_seed as accelera
 from oat.common.hydra_util import register_new_resolvers
 from oat.common.p2n_new_capabilities import (
     policy_capability, predict_validation_action, resolve_update_schedule, validate_history_batch)
+from oat.env_runner.p2n_vla_rollout import (
+    GpuMemorySampler, close_runner, resolve_renderer, rollout_runner_config, scope_runner_to_renderer,
+    summarize_records)
 from oat.model.common.trainable_ema import TrainableEMA
 from oat.workspace.base_workspace import BaseWorkspace, _atomic_torch_save, _copy_to_cpu
 from oat.workspace.train_p2n_new import TrainP2NNewWorkspace, _cap_dataloader
@@ -195,6 +210,49 @@ def _preserved_modes(module: torch.nn.Module):
     finally:
         for child, mode in modes:
             child.training = mode
+
+
+@contextlib.contextmanager
+def _snapshot_precision(named: Sequence[Tuple[str, torch.nn.Parameter]], dtype=torch.bfloat16):
+    """Temporarily round the trainable parameters to the snapshot dtype, in place.
+
+    Snapshots store the trainable tensors as ``tensor.to(bf16)``, and ``from_checkpoint`` upcasts them exactly, so
+    an in-training rollout then scores bitwise the weights that ``snapshots/upd-NNNNNN_*.ckpt`` hold (and that
+    ``scripts/evaluate_p2n_vla.py`` loads). The exact values are stashed on the CPU and copied back on exit; under
+    ``swap_in`` that is the EMA shadow. This costs no extra GPU memory, which matters because rank 0 also hosts the
+    simulators' EGL renderers during a rollout.
+    """
+    stash = []
+    try:
+        with torch.no_grad():
+            for _, parameter in named:
+                if parameter.is_floating_point() and parameter.dtype != dtype:
+                    stash.append((parameter, parameter.detach().to("cpu", copy=True)))
+                    parameter.copy_(parameter.to(dtype))
+        yield
+    finally:
+        with torch.no_grad():
+            for parameter, original in reversed(stash):
+                parameter.copy_(original.to(parameter.device))
+
+
+def _kill_children(children) -> int:
+    """Terminate, then kill, the given multiprocessing children (simulator workers); returns how many were alive."""
+    alive = [child for child in children if child.is_alive()]
+    for child in alive:
+        try:
+            child.terminate()
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+    for child in alive:
+        try:
+            child.join(timeout=5)
+            if child.is_alive():
+                child.kill()
+                child.join(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+    return len(alive)
 
 
 class EpochSeededRandomSampler(Sampler):
@@ -403,6 +461,7 @@ class _Run:
     log: _JsonlLog
     trackers: bool
     validation_enabled: bool
+    rollout_enabled: bool = False
     group_names: List[str] = field(default_factory=list)
     checked_gradients: bool = False
 
@@ -430,6 +489,10 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
         self.generators: Dict[str, torch.Generator] = {}
         self.ddp_settings = None
         self.last_validation = None
+        self.rollout_renderer: Optional[Dict[str, Any]] = None
+        self.rollouts: List[Dict[str, Any]] = []
+        self.last_rollout: Optional[Dict[str, Any]] = None
+        self._rollout_media: Dict[str, Any] = {}
         self.probe_report = None
         self.saved_snapshots: List[str] = []
         self._trainable_names: List[str] = []
@@ -449,9 +512,22 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
             raise ValueError("P2N-VLA starts from pi05_base; init_checkpoint is unsupported (use resume)")
         if training.get("resume") and not training.get("resume_checkpoint"):
             raise ValueError("Resume requires training.resume_checkpoint")
-        if cfg.task.policy.get("lazy_eval", True) is not True:
-            raise ValueError("P2N-VLA training runs no simulator rollouts; set task.policy.lazy_eval=true "
-                             "and evaluate snapshots with scripts/evaluate_p2n_vla.py")
+        lazy_eval = cfg.task.policy.get("lazy_eval", True)
+        if not isinstance(lazy_eval, bool):
+            raise ValueError("task.policy.lazy_eval must be a boolean")
+        if not lazy_eval:
+            _positive_int(training.get("rollout_every"), "training.rollout_every")
+            runner = cfg.task.policy.get("env_runner")
+            if runner is None or not runner.get("_target_"):
+                raise ValueError("In-training rollouts (lazy_eval=false) need task.policy.env_runner")
+            _positive_int(runner.get("n_test"), "task.policy.env_runner.n_test")
+            _positive_int(runner.get("n_parallel_envs"), "task.policy.env_runner.n_parallel_envs")
+            if training.get("rollout_failure", "continue") not in ("continue", "raise"):
+                raise ValueError("training.rollout_failure must be continue or raise")
+            timeout = float(training.get("rollout_timeout_minutes", 100))
+            if not 0 < timeout < 120:
+                raise ValueError("training.rollout_timeout_minutes must lie in (0, 120): the other ranks wait in a "
+                                 "barrier bounded by the 2 h process-group timeout")
         for key in ("num_epochs", "gradient_accumulate_every", "checkpoint_every", "val_every"):
             _positive_int(training.get(key), f"training.{key}")
         _positive_int(training.get("log_every", 1), "training.log_every")
@@ -801,8 +877,23 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                                              "tensors": len(ema.names), "elements": ema.num_elements()},
             "update_schedule": self.update_schedule, "dataset_split": self.dataset_split,
             "ddp": self.ddp_settings, "world_size": self.world_size,
+            "rollout": self.rollout_settings(),
             "policy_metadata": metadata,
         }
+
+    def rollout_settings(self) -> Dict[str, Any]:
+        cfg = self.cfg
+        if cfg.task.policy.get("lazy_eval", True):
+            return {"enabled": False}
+        runner = OmegaConf.to_container(cfg.task.policy.env_runner, resolve=True)
+        return {"enabled": True, "every_epochs": int(cfg.training.rollout_every),
+                "at_final_epoch": bool(cfg.training.get("rollout_at_final", True)),
+                "seed": int(cfg.training.get("rollout_seed", 44)),
+                "weights": "ema" if bool(cfg.training.get("use_ema", True)) else "model", "rank": 0,
+                **{key: runner.get(key) for key in ("_target_", "protocol", "n_test", "n_parallel_envs",
+                                                    "test_start_seed", "init_state_offset", "max_episode_steps",
+                                                    "n_test_vis")},
+                "renderer": self.rollout_renderer}
 
     # -------------------------------------------------------------- one update
     def _optimizer_update(self, run: _Run, max_norm):
@@ -1029,6 +1120,202 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
         })
         return result
 
+    # ------------------------------------------------------------------ rollouts
+    def rollout_due(self, completed_epoch: int, final: bool) -> bool:
+        """After every ``rollout_every`` completed epochs (1-indexed: 50, 100, ...) and at the final epoch."""
+        training = self.cfg.training
+        if (int(completed_epoch) + 1) % int(training.rollout_every) == 0:
+            return True
+        return bool(final) and bool(training.get("rollout_at_final", True))
+
+    @staticmethod
+    def _rollout_history(output) -> List[Dict[str, Any]]:
+        """Every rollout of this run directory, including those written before a resume."""
+        history = []
+        for directory in pathlib.Path(output).glob("eval/rollout_*"):
+            path = directory / "summary.json"
+            try:
+                summary = json.loads(path.read_text())
+            except (OSError, ValueError):
+                # Interrupted (e.g. the run died during the rollout): re-evaluate the snapshot of that step.
+                history.append({"tag": directory.name.removeprefix("rollout_"), "epoch": None, "optimizer_step": None,
+                                "success_rate": None, "trials": 0, "incomplete": True, "dir": str(directory)})
+                continue
+            history.append({"tag": summary.get("tag"), "epoch": summary.get("epoch"),
+                            "optimizer_step": summary.get("optimizer_step"),
+                            "success_rate": summary.get("success_rate"), "trials": summary.get("trials"),
+                            "failed": bool(summary.get("failed", False)), "dir": str(path.parent)})
+        return sorted(history, key=lambda item: (item["optimizer_step"] if item["optimizer_step"] is not None
+                                                 else -1, item["dir"]))
+
+    def _rollout_dir(self, tag: str) -> pathlib.Path:
+        base = pathlib.Path(self.output_dir) / "eval" / f"rollout_{tag}"
+        path, index = base, 1
+        while path.exists():  # an epoch replayed after a resume keeps its earlier result
+            path = base.with_name(f"{base.name}_r{index}")
+            index += 1
+        return path
+
+    def _rollout(self, run: _Run, completed_epoch: Optional[int], *, n_test: Optional[int] = None,
+                 tag: Optional[str] = None, on_failure: Optional[str] = None) -> Dict[str, Any]:
+        """Simulator evaluation on rank 0 with the EMA (or live) weights while the other ranks wait.
+
+        The runner comes from ``task.policy.env_runner``, so its episode schedule equals that of
+        ``scripts/evaluate_p2n_vla.py`` with the same protocol, n_test and episode seeds. It is built for each
+        evaluation, so its simulators and EGL renderers (on this rank's GPU) are freed afterwards. Training RNG
+        streams, live weights and module modes are restored exactly. Only rank 0 rolls out, so the DDP replicas
+        stay identical. Returns the epoch-record metrics (empty on the other ranks).
+
+        A failed rollout (e.g. a crashed simulator) prints its traceback at once, kills the simulators and restores
+        the policy. With ``training.rollout_failure=continue`` (default) it is recorded (``summary.json`` with
+        ``failed: true``, metric ``rollout/failed``) and training goes on, since the snapshot can be re-evaluated
+        with ``scripts/evaluate_p2n_vla.py``. With ``raise`` the run stops.
+        """
+        cfg, accelerator, policy = self.cfg, run.accelerator, run.policy
+        on_failure = on_failure or str(cfg.training.get("rollout_failure", "continue"))
+        device = accelerator.device
+        accelerator.wait_for_everyone()
+        metrics: Dict[str, Any] = {}
+        if accelerator.is_main_process:
+            started = time.monotonic()
+            if tag is None:
+                tag = f"epoch-{int(completed_epoch) + 1:04d}_upd-{self.completed_optimizer_steps:06d}"
+            output = self._rollout_dir(tag)
+            output.mkdir(parents=True)
+            template = OmegaConf.to_container(cfg.task.policy.env_runner, resolve=True)
+            runner_cfg = rollout_runner_config(template, n_action_steps=policy.n_action_steps,
+                                               n_obs_steps=policy.n_obs_steps, output_dir=output, n_test=n_test)
+            runner_cfg = scope_runner_to_renderer(runner_cfg, self.rollout_renderer)
+            uuid = str(torch.cuda.get_device_properties(device).uuid) if device.type == "cuda" else None
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()  # hand cached activation blocks back to the driver for the renderers
+            python_state, numpy_state = random.getstate(), np.random.get_state()
+            fork_devices = [device.index if device.index is not None else torch.cuda.current_device()] \
+                if device.type == "cuda" else []
+            seed = int(cfg.training.get("rollout_seed", 44))
+            runner, records, log_data, failed, sampler = None, [], {}, True, None
+            error_text = traceback_text = None
+            snapshot = (str(self.snapshot_path(self.completed_optimizer_steps))
+                        if self.last_snapshot_step == self.completed_optimizer_steps else None)
+            # Watchdog: a simulator that hangs (rather than crashes) would block the runner forever while rank 1
+            # waits in a barrier. Killing the simulators this rollout started unblocks it with an error, so a hang
+            # becomes an ordinary failed rollout well before the 2 h process-group timeout.
+            children_before = set(multiprocessing.active_children())
+            timeout_minutes = float(cfg.training.get("rollout_timeout_minutes", 100))
+            timed_out = threading.Event()
+
+            def _expire():
+                timed_out.set()
+                _kill_children(set(multiprocessing.active_children()) - children_before)
+
+            watchdog = threading.Timer(timeout_minutes * 60.0, _expire)
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                with torch.random.fork_rng(devices=fork_devices):
+                    random.seed(seed)
+                    np.random.seed(seed)
+                    torch.manual_seed(seed)
+                    if device.type == "cuda":
+                        torch.cuda.manual_seed(seed)
+                    swap = run.ema.swap_in(policy) if run.ema is not None else _preserved_modes(policy)
+                    # bf16-rounded trainables: the score is that of the snapshot saved at this step.
+                    with swap, _snapshot_precision(run.named), torch.no_grad():
+                        policy.eval()
+                        policy.reset()
+                        # Simulators fork (and allocate their EGL renderers) here, before the sampler thread
+                        # starts shelling out to nvidia-smi; the renderer memory stays resident while running.
+                        runner = hydra.utils.instantiate(runner_cfg)
+                        with GpuMemorySampler(uuid, interval=5.0) as sampler:
+                            log_data = runner.run(policy) or {}  # predict_action runs under inference_mode
+                        records = [dict(record) for record in runner.last_episode_records]
+                if len(records) != int(runner_cfg["n_test"]):
+                    raise RuntimeError(f"Rollout returned {len(records)} episode records, "
+                                       f"expected {runner_cfg['n_test']}")
+                failed = False
+            except BaseException as error:
+                # Print before any cleanup: the other ranks wait in a barrier, and a cleanup that blocked would
+                # otherwise swallow the reason.
+                traceback.print_exc()
+                sys.stderr.flush()
+                if on_failure != "continue" or not isinstance(error, Exception):
+                    raise
+                # Keep text only: a reference to the exception would keep the failed frames (GPU tensors) alive.
+                error_text = f"{type(error).__name__}: {error}"
+                if timed_out.is_set():
+                    error_text = f"rollout exceeded {timeout_minutes:g} min; simulators killed ({error_text})"
+                traceback_text = traceback.format_exc()
+            finally:
+                watchdog.cancel()
+                if runner is not None:
+                    close_runner(runner, force=failed)
+                if failed:  # e.g. a simulator failing during construction: no runner, but forked workers
+                    _kill_children(set(multiprocessing.active_children()) - children_before)
+                policy.reset()  # drop rollout buffers created under the runner's inference_mode
+                random.setstate(python_state)
+                np.random.set_state(numpy_state)
+            if error_text is not None:
+                runner = log_data = records = None
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                seconds = time.monotonic() - started
+                summary = {"failed": True, "error": error_text, "traceback": traceback_text,
+                           "tag": tag, "epoch": None if completed_epoch is None else int(completed_epoch) + 1,
+                           "optimizer_step": self.completed_optimizer_steps, "variant": cfg.variant,
+                           "snapshot": snapshot, "rollout_seconds": seconds}
+                (output / "summary.json").write_text(json.dumps(_sanitize(summary), indent=2, sort_keys=True) + "\n")
+                entry = {"tag": tag, "epoch": summary["epoch"], "optimizer_step": summary["optimizer_step"],
+                         "success_rate": None, "trials": 0, "failed": True, "dir": str(output)}
+                self.rollouts.append(entry)
+                self.last_rollout = entry
+                metrics = {"rollout/failed": 1, "rollout/seconds": seconds, "rollout_dir": str(output),
+                           "rollout_error": summary["error"]}
+                accelerator.print(f"Rollout {tag} FAILED after {seconds / 60:.1f} min ({summary['error']}); "
+                                  f"training continues; re-evaluate {snapshot or 'the next snapshot'} offline")
+                self._rollout_media = {}
+                accelerator.wait_for_everyone()
+                return metrics
+            summary = summarize_records(records)
+            seconds = time.monotonic() - started
+            memory = sampler.report()
+            summary.update({
+                "tag": tag, "epoch": None if completed_epoch is None else int(completed_epoch) + 1,
+                "optimizer_step": self.completed_optimizer_steps, "variant": cfg.variant,
+                "weights": "ema" if run.ema is not None else "model", "precision": "bf16 trainables (= snapshot)",
+                "protocol": runner_cfg.get("protocol"),
+                "episode_start_seed": runner_cfg.get("test_start_seed"), "seed": seed,
+                "init_state_offset": runner_cfg.get("init_state_offset", 0),
+                "max_episode_steps": runner_cfg.get("max_episode_steps"),
+                "n_parallel_envs": runner_cfg.get("n_parallel_envs"), "runner_target": runner_cfg["_target_"],
+                "renderer": self.rollout_renderer, "rollout_seconds": seconds, "gpu_memory": memory,
+                "snapshot": snapshot, "failed": False,
+            })
+            (output / "summary.json").write_text(json.dumps(_sanitize(summary), indent=2, sort_keys=True) + "\n")
+            entry = {"tag": tag, "epoch": summary["epoch"], "optimizer_step": summary["optimizer_step"],
+                     "success_rate": summary["success_rate"], "trials": summary["trials"], "dir": str(output)}
+            self.rollouts.append(entry)
+            self.last_rollout = entry
+            low, high = summary["wilson_95_interval"]
+            metrics = {"rollout/failed": 0, "rollout/success_rate": summary["success_rate"],
+                       "rollout/macro_task_success_rate": summary["macro_task_success_rate"],
+                       "rollout/successes": summary["successes"], "rollout/trials": summary["trials"],
+                       "rollout/wilson_low": low, "rollout/wilson_high": high, "rollout/seconds": seconds,
+                       "rollout/peak_gpu_used_gb": memory["peak_used_gb"],
+                       "rollout/gpu_headroom_gb": memory["headroom_gb"],
+                       "mean_success_rate": summary["success_rate"],  # the legacy LIBERO runner's key
+                       "rollout_dir": str(output)}
+            for name, stats in summary["per_task"].items():
+                metrics[f"rollout/task/{name}"] = stats["success_rate"]
+            # n_test_vis > 0: the runner returns wandb.Video objects; they go to W&B only (not logs.jsonl).
+            self._rollout_media = {f"rollout/{key}": value for key, value in log_data.items()
+                                   if "/video_" in str(key) and not isinstance(value, numbers.Real)}
+            accelerator.print(f"Rollout {tag}: success {summary['successes']}/{summary['trials']} "
+                              f"= {summary['success_rate']:.3f} in {seconds / 60:.1f} min")
+        accelerator.wait_for_everyone()
+        return metrics
+
     @torch.no_grad()
     def _replica_check(self, run: _Run):
         """DDP replicas must stay bitwise identical; compare cheap per-rank fingerprints."""
@@ -1112,6 +1399,15 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
         if batches and run.validation_enabled:
             validation = self._validate(run, max_batches=batches)
             memory["validation"] = self._memory(device)
+        rollout = None
+        episodes = int(probe.get("rollout_episodes", 0) or 0)
+        if episodes and run.rollout_enabled:
+            # The first `episodes` of the in-training schedule (official: one initial state per task) on rank 0,
+            # with nvidia-smi sampled throughout: EGL renderer memory is invisible to torch.
+            runner = cfg.task.policy.env_runner
+            episodes = max(episodes, min(int(runner.n_parallel_envs), int(runner.n_test)))  # a full chunk
+            rollout = self._rollout(run, None, n_test=episodes, tag="probe", on_failure="raise")
+            memory["rollout"] = self._memory(device)
         local = {"rank": accelerator.process_index, "device": str(device), "memory": memory,
                  "total_memory_gib": (torch.cuda.get_device_properties(device).total_memory / GIB
                                       if device.type == "cuda" else None)}
@@ -1135,6 +1431,10 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
             go = None
             if total is not None:
                 go = bool(peak * GIB / 1e9 <= limit and headroom >= headroom_needed)
+            # During a rollout rank 0 also hosts the simulators' EGL renderers (nvidia-smi peak, not torch).
+            rollout_headroom = None if rollout is None else rollout.get("rollout/gpu_headroom_gb")
+            if go is not None and rollout_headroom is not None:
+                go = bool(go and rollout_headroom >= headroom_needed)
             report = {
                 "variant": cfg.variant, "world_size": accelerator.num_processes,
                 "micro_batch_per_rank": int(cfg.dataloader.batch_size), "accumulation": accumulation,
@@ -1142,10 +1442,10 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                 "optimizer_steps": steps, "self_past_step": int(target), "self_past_p": probability,
                 "seconds_per_update": update_seconds, "samples_per_sec": samples_per_sec,
                 "last_train_components": components, "worst_case_pass": worst,
-                "validation": validation, "ranks": ranks,
+                "validation": validation, "rollout": rollout, "ranks": ranks,
                 "peak_reserved_gb": peak * GIB / 1e9, "peak_reserved_gib": peak,
                 "go_no_go": {"max_reserved_gb": limit, "min_headroom_gb": headroom_needed,
-                             "headroom_gb": headroom, "pass": go},
+                             "headroom_gb": headroom, "rollout_headroom_gb": rollout_headroom, "pass": go},
                 "nvidia_smi": smi, "created_utc": datetime.now(timezone.utc).isoformat(),
             }
             path = pathlib.Path(self.output_dir) / "probe.json"
@@ -1296,7 +1596,11 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
         run = _Run(accelerator=accelerator, model=model, policy=policy, optimizer=optimizer, scheduler=scheduler,
                    ema=ema, named=named, clip=clip, train_loader=train_loader, val_loader=val_loader,
                    log=_JsonlLog(output / "logs.jsonl", accelerator.is_main_process),
-                   trackers=log_with is not None, validation_enabled=validation_enabled)
+                   trackers=log_with is not None, validation_enabled=validation_enabled,
+                   rollout_enabled=not bool(cfg.task.policy.get("lazy_eval", True)))
+        if run.rollout_enabled and accelerator.is_main_process:
+            # Resolved once, before any rollout forks simulators (the probe briefly opens CUDA contexts).
+            self.rollout_renderer = resolve_renderer(device)
         report = self.training_report(policy, optimizer, clip, ema)
         if accelerator.is_main_process:
             output.mkdir(parents=True, exist_ok=True)
@@ -1317,14 +1621,20 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                 tracker.define_metric("*", step_metric="optimizer_step")
 
         if probe:
-            try:
-                return self._probe(run)
-            finally:
-                accelerator.end_training()
+            # Tear the process group down only on success: destroying it while a peer is still inside a
+            # collective can block forever and hide the error (the traceback prints only after cleanup).
+            report = self._probe(run)
+            accelerator.end_training()
+            return report
 
         if training.get("resume"):
             # After every constructor, DDP broadcast and tracker; before the first draw.
             self._restore_rng(accelerator.process_index, accelerator.num_processes, device)
+            if accelerator.is_main_process:
+                for item in self._rollout_history(output):
+                    if item.get("incomplete"):
+                        accelerator.print(f"WARNING: rollout {item['dir']} never finished (the run stopped during "
+                                          f"it); re-evaluate that step's snapshot with scripts/evaluate_p2n_vla.py")
 
         num_epochs = int(training.num_epochs)
         keep_resume = bool(training.get("keep_resume_checkpoint", False))
@@ -1346,7 +1656,11 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                 record.update(self.last_validation)
             record["replica_fingerprint"] = self._replica_check(run)
             self._gather_rng(accelerator)
-            checkpoint_due = completed_epoch % int(training.checkpoint_every) == 0 or final
+            rollout_due = run.rollout_enabled and self.rollout_due(completed_epoch, final)
+            # A resume checkpoint right before each rollout: a run that dies during the ~45 min rollout resumes
+            # after this epoch (re-evaluate its snapshot with scripts/evaluate_p2n_vla.py) instead of replaying
+            # up to checkpoint_every epochs.
+            checkpoint_due = completed_epoch % int(training.checkpoint_every) == 0 or final or rollout_due
             if accelerator.is_main_process:
                 saved_started = time.monotonic()
                 if checkpoint_due and (keep_resume or not final):
@@ -1365,6 +1679,24 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                 if run.trackers:
                     accelerator.log(_numeric(record))
                 accelerator.print(json.dumps(_sanitize(record)))
+            # After this epoch's checkpoint, snapshot and record: the summary links the snapshot it scored (the
+            # epoch ends on a snapshot step), and a crash during the rollout loses neither training nor logs.
+            if rollout_due and self.last_snapshot_step != self.completed_optimizer_steps:
+                # Skipped updates can shift the 5k-update snapshots off the rollout epochs: every rollout gets a
+                # snapshot of exactly the weights it scores.
+                if accelerator.is_main_process:
+                    self.save_snapshot()
+                self.last_snapshot_step = self.completed_optimizer_steps
+            if rollout_due:
+                metrics = self._rollout(run, completed_epoch)
+                if accelerator.is_main_process:
+                    rollout_record = {"event": "rollout", "epoch": completed_epoch,
+                                      "optimizer_step": self.completed_optimizer_steps,
+                                      "global_step": self.global_step, **metrics}
+                    run.log.write(rollout_record)
+                    if run.trackers:
+                        accelerator.log({**_numeric(rollout_record), **self._rollout_media})
+                    self._rollout_media = {}
             accelerator.wait_for_everyone()
 
         if accelerator.is_main_process:
@@ -1373,7 +1705,8 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                        "stopped_by_max_optimizer_steps": stopped,
                        "snapshots": sorted(str(path) for path in (output / "snapshots").glob("upd-*.ckpt")),
                        "resume_checkpoint_kept": self.get_checkpoint_path().exists(),
-                       "last_validation": self.last_validation}
+                       "last_validation": self.last_validation,
+                       "rollouts": self._rollout_history(output), "last_rollout": self.last_rollout}
             (output / "training_summary.json").write_text(json.dumps(_sanitize(summary), indent=2) + "\n")
         accelerator.wait_for_everyone()
         accelerator.end_training()

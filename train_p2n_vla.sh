@@ -3,6 +3,8 @@
 #   bash train_p2n_vla.sh --variant p2n_vla_state_gate --task libero --devices 0,1 --preflight
 #   bash train_p2n_vla.sh --variant p2n_vla_state_gate --task libero --devices 0,1 --probe
 #   bash train_p2n_vla.sh --variant p2n_vla --task libero --devices 0,1 --output output/training/p2n_vla_s42
+#   bash train_p2n_vla.sh --variant p2n_vla --task libero --devices 0,1 --output output/training/p2n_vla_libero10_s42 \
+#       -- task.policy.lazy_eval=false logging.mode=online      # + official LIBERO-10 eval every 50 epochs, live W&B
 #   bash train_p2n_vla.sh --variant p2n_vla --task libero --devices 0,1 --output output/training/p2n_vla_s42 \
 #       --resume output/training/p2n_vla_s42/checkpoints/latest.ckpt
 # Hydra overrides follow `--`. Choose the interpreter with --python PATH or P2N_PYTHON (default /venv/oat).

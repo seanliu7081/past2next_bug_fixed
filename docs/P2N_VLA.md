@@ -155,7 +155,9 @@ Preflight checks each of the following:
 - **pi05 weights.** The sha256 comes from the HF blob name; `--full-hash` re-hashes all 14.5 GB instead. The header must hold 812 tensors.
 - **SentencePiece model.** Its sha256 must match.
 - **Prompt length.** The worst case must fit in 96 tokens. Every instruction is tried with every state bin at 3 digits; the longest is uid 34 at 62 tokens.
-- **Update schedule.** It reports 7,500 micro-batches per rank per epoch, 3,750 updates per epoch and 30,000 updates in total.
+- **Update schedule.** It reports 200 micro-batches per rank per epoch, 100 updates per epoch, 300 epochs and 30,000 updates in total.
+- **In-training rollouts** (only with `task.policy.lazy_eval=false`): the EGL renderer probe and the rollout plan.
+- **W&B** (only with `logging.mode=online`): credentials from `WANDB_API_KEY` or `wandb login`'s `~/.netrc` entry.
 - **Model build.** It builds the full policy on CPU and reports:
   - parameter counts;
   - optimizer groups and clip groups;
@@ -174,6 +176,8 @@ Nothing else may run on the GPUs during the probe.
 ```bash
 bash train_p2n_vla.sh --variant p2n_vla_state_gate --task libero --devices 0,1 --probe            # self-past at p=0.5
 bash train_p2n_vla.sh --variant p2n_vla_state_gate --task libero --devices 0,1 --probe --probe-self-past-step 0   # p=0
+# with in-training rollouts: also one official chunk (10 episodes) on rank 0, measuring the EGL renderer memory
+bash train_p2n_vla.sh --variant p2n_vla_state_gate --task libero --devices 0,1 --probe -- task.policy.lazy_eval=false
 ```
 
 The probe launches torchrun and runs the following:
@@ -192,19 +196,59 @@ The probe writes no checkpoints.
 
 ### 3.4 Train
 
-Run the training command inside tmux.
+Run the training command inside tmux. Each run uses both GPUs, so run the variants one after the other.
+
+**LIBERO-10 training with in-training official evaluation, logged live to W&B.**
 
 ```bash
 tmux new -s p2n_vla
+bash train_p2n_vla.sh --variant p2n_vla --task libero --devices 0,1 --output output/training/p2n_vla_libero10_s42 \
+    -- task.policy.lazy_eval=false logging.mode=online
+# when it has finished:
+bash train_p2n_vla.sh --variant p2n_vla_state_gate --task libero --devices 0,1 --output output/training/p2n_vla_state_gate_libero10_s42 \
+    -- task.policy.lazy_eval=false logging.mode=online
+```
+
+With `task.policy.lazy_eval=false`, the following happens after epochs 50, 100, …, 300 (`training.rollout_every=50`; one epoch is 100 updates, so every 5,000 updates, on the snapshot steps):
+- **Who and what.** Rank 0 evaluates the EMA weights with LIBERO's official protocol: 50 episodes per task, which is each task's 50 fixed initial states once (500 episodes), with episode seeds 3000–3499. The settings live in `task.policy.env_runner`. The schedule is identical to `scripts/evaluate_p2n_vla.py --protocol official --n-test 500 --seed 44 --episode-start-seed 3000`.
+- **Rendering and time.** The simulators render on rank 0's own GPU, and rank 1 waits. Episodes run in chunks of `n_parallel_envs` = 10, and a chunk lasts until its slowest episode ends: about 47 s at the 550-step budget. One evaluation is therefore 50 chunks, about 40 minutes plus a minute of simulator start-up. The launcher refuses settings whose expected time comes near `training.rollout_timeout_minutes` (100). Rank 1's barrier is bounded by the 2 h process-group timeout, so do not shrink `n_parallel_envs` far.
+- **Memory.** The probe measured a 20.6 GB peak on GPU 0 with the training state plus 10 renderers (about 0.55 GB each), leaving 5.1 GB headroom.
+- **Results.** Each evaluation writes `eval/rollout_epoch-EEEE_upd-NNNNNN/{summary.json,episodes.jsonl}`, linked to the snapshot of the same step (a snapshot is saved for every rollout step). The epoch record (training and validation) is written first. The rollout then writes its own record (`"event": "rollout"`, the same `optimizer_step`; `epoch` is 0-indexed in both) to `logs.jsonl` and W&B, with:
+  - `rollout/success_rate`, `rollout/macro_task_success_rate` and its Wilson bounds;
+  - `rollout/task/<task>` for every task;
+  - `rollout/peak_gpu_used_gb`, `rollout/failed`;
+  - `mean_success_rate`, the legacy key.
+- **Isolation.** Training RNG streams, live weights and module modes are restored exactly, so rollouts do not change what training computes. On CPU the trajectory is bit-identical (tested). CUDA kernels such as SDPA backward are not deterministic, so GPU runs are never bitwise reproducible, with or without rollouts.
+- **What is scored.** The EMA weights, rounded to bf16 exactly as the snapshot stores them. The in-training success rate therefore belongs to `snapshots/upd-NNNNNN_ema.ckpt`, and `scripts/evaluate_p2n_vla.py` on that snapshot loads bitwise the same weights.
+- **Checkpoints.** A resume checkpoint is written right before every rollout except the final one. At the end training is complete, `latest.ckpt` is removed as usual, and the final snapshot remains.
+- **Failures.** A simulator that crashes is killed, never waited on, and the traceback prints at once. One that hangs is killed by a watchdog after `training.rollout_timeout_minutes`. A failure during simulator start-up kills the workers already forked. With `training.rollout_failure=continue` (the default), the failure is recorded (`rollout/failed`, plus `summary.json` with `failed: true`) and training continues; re-evaluate that snapshot with `scripts/evaluate_p2n_vla.py`. With `raise`, the run stops. If the whole run dies during a rollout, its `eval/rollout_*` folder has no `summary.json`. The resume continues after that epoch, warns about it, and `training_summary.json` lists it as incomplete; re-evaluate that step's snapshot.
+- **What "official" means here.** LIBERO's saved initial states 0–49 per task and LIBERO's 5 zero-action settling steps, with this repository's step budget of 550 policy steps (settling not counted). That is the budget every evaluation and baseline in this repo uses, including the 0.772-SR policy. LIBERO's own evaluator defaults to 600 steps, and openpi/OpenVLA use 520 plus 10 wait steps. State the budget when comparing with published numbers, or set `-- task.policy.env_runner.max_episode_steps=600`. `scripts/evaluate_p2n_vla.py` uses the run's own budget unless `--max-episode-steps` is given.
+- **Total length.** About 24 h of training (11.2 samples/s once self-past has ramped up) plus 6 × about 41 min of evaluation, roughly 28 h per variant.
+
+Selecting a checkpoint by these official-protocol numbers selects on the final test schedule. Report the last evaluation, or say that the best one was selected.
+
+Without the override, `task.policy.lazy_eval` stays `true`, so there are no in-training rollouts; evaluate snapshots with `scripts/evaluate_p2n_vla.py` (section 5):
+
+```bash
 bash train_p2n_vla.sh --variant p2n_vla --task libero --devices 0,1 --output output/training/p2n_vla_s42
 ```
 
-**Resume.** Resume is epoch-granular. It restarts at the epoch after the one `latest.ckpt` recorded, so any updates made after that checkpoint are replayed (bitwise, per rank) and `logs.jsonl` receives their records again. It needs the same world size, variant, architecture, trainable-parameter order, data split, optimizer recipe and update schedule. `training.max_optimizer_steps` (the cosine horizon) cannot change; `training.num_epochs` may, but training still stops at `max_optimizer_steps`. To continue the same W&B run, add `-- logging.id=<id> logging.resume=allow`.
+**Resume.** Resume is epoch-granular. `latest.ckpt` is written every 10 epochs (1,000 updates), so a crash replays at most about 1,000 updates. It restarts at the epoch after the one `latest.ckpt` recorded, so any updates made after that checkpoint are replayed (with the same data order and RNG streams; bitwise on CPU) and `logs.jsonl` receives their records again. It needs the same world size, variant, architecture, trainable-parameter order, data split, optimizer recipe and update schedule. `training.max_optimizer_steps` (the cosine horizon) cannot change; `training.num_epochs` may, but training still stops at `max_optimizer_steps`. To continue the same W&B run, add `-- logging.id=<id> logging.resume=allow`.
 
 ```bash
 bash train_p2n_vla.sh --variant p2n_vla --task libero --devices 0,1 --output output/training/p2n_vla_s42 \
     --resume output/training/p2n_vla_s42/checkpoints/latest.ckpt
 ```
+
+A resume rebuilds the configuration from the defaults, so pass every `--` override of the original run again; the launcher warns when `task.policy.lazy_eval`, `training.rollout_every` or `logging.mode` differ from the checkpoint's run. For the in-training-evaluation run, continuing the same W&B run (`<id>` is the suffix of `<run>/wandb/run-<timestamp>-<id>`; `logging.resume` only applies online):
+
+```bash
+bash train_p2n_vla.sh --variant p2n_vla --task libero --devices 0,1 --output output/training/p2n_vla_libero10_s42 \
+    --resume output/training/p2n_vla_libero10_s42/checkpoints/latest.ckpt \
+    -- task.policy.lazy_eval=false logging.mode=online logging.id=<id> logging.resume=allow
+```
+
+Epochs replayed after a resume that had already been evaluated keep their earlier result: the new one goes to `eval/rollout_..._r1`. `training_summary.json` lists every rollout found on disk.
 
 **Other variants.** These use the same recipe, seed and OAT tokenizer:
 
@@ -286,10 +330,12 @@ A short run with the default EMA (decay 0.999, a time constant of about 1,000 up
   p2n_vla_resolved.yaml, p2n_vla_preflight.json    launcher (resumes add _resume_<timestamp>)
   resolved_config.yaml, training_report.json         workspace start-up (parameters, groups, schedule, DDP settings)
   dataset_split.json                                 episode ids and dataset identity hash
-  logs.jsonl                                         train_step / skipped_update / epoch records
-  checkpoints/latest.ckpt                            resume payload; rewritten each epoch, deleted after the final snapshot
+  logs.jsonl                                         train_step / skipped_update / epoch / rollout records
+  eval/rollout_epoch-EEEE_upd-NNNNNN/                in-training official rollouts: summary.json, episodes.jsonl
+  checkpoints/latest.ckpt                            resume payload; written every 10 epochs and before every rollout,
+                                                     deleted after the final snapshot
   snapshots/upd-005000_ema.ckpt ... upd-030000_ema.ckpt   EMA artifacts (about 0.73 GB each)
-  training_summary.json                              final counters, snapshot list, last validation
+  training_summary.json                              final counters, snapshot list, last validation, every rollout
   wandb/                                             offline W&B run (unless logging.mode=disabled)
   eval/<snapshot>_<weights>_<protocol>_n<N>_seed<S>_ep<E>[_k<k>][_T<t>][_gate-<mode>]...
                                                      default output of scripts/evaluate_p2n_vla.py (one suffix per
@@ -308,9 +354,13 @@ The recipe lives in `oat/config/train_p2n_vla.yaml`; the gate and flow configs i
 | GPUs | 2 |
 | Gradient accumulation | 2 |
 | Effective batch | 32 |
-| Epochs (`num_epochs`) | 8 |
-| `max_train_steps` | 7,500 micro-batches per rank per epoch |
+| Epochs (`num_epochs`) | 300 |
+| `max_train_steps` | 200 micro-batches per rank per epoch, so an epoch is 100 updates (3,200 windows). One pass over the 124,600 training windows is 3,894 updates, and 30k updates are 7.7 passes. Every epoch draws a fresh seeded permutation |
 | Updates | 30,000 (`max_optimizer_steps`, also the cosine horizon) |
+| Validation (`val_every`) | Every 50 epochs: after epochs 1, 51, …, 251 and the last |
+| Resume checkpoint (`checkpoint_every`) | Every 10 epochs |
+| Snapshots (`snapshot_every`) | Every 5,000 updates (`snapshots/upd-NNNNNN_ema.ckpt`) |
+| In-training rollouts (`rollout_every`) | Every 50 epochs, after epochs 50 … 300, only with `task.policy.lazy_eval=false` |
 
 **Optimizer and schedule**
 - **AdamW:** betas (0.9, 0.95), eps 1e-8, weight decay 1e-10, fused when every parameter is on CUDA.
@@ -339,7 +389,7 @@ The recipe lives in `oat/config/train_p2n_vla.yaml`; the gate and flow configs i
 **Other policy settings**
 - λ_KI = 1.0, LoRA r16/α16, `adarms_t0` = 0.6, `max_prompt_len` = 96, `model_size` = full, activation checkpointing on.
 
-**Validation** runs every epoch on the EMA weights, over 200 batches per rank. It draws a strided subset spanning all 50 validation episodes, with a fixed RNG stream that leaves the training RNG untouched. It reports:
+**Validation** runs every 50 epochs on the EMA weights, over 200 batches per rank. It draws a strided subset spanning all 50 validation episodes, with a fixed RNG stream that leaves the training RNG untouched. It reports:
 - expert-history and generated-history losses and their components;
 - stateless `predict_action` reconstruction MSE against ground-truth past commands, over all 16 steps and over the 8 executed steps;
 - gate metrics.
@@ -519,7 +569,8 @@ These are the calls the workspace, the launcher and the eval script make on a po
 | Real-asset/GPU suite, `-m "requires_pi05 or gpu"` | 37 passed, after seeding the live-render orientation test (below) |
 | fp32 parity with LeRobot PI0.5 (`tests/test_p2n_vla_parity.py`) | Every stage bitwise on CPU; on CUDA, at most 9e-6 relative (SDPA kernel choice, cuBLAS 12.9 vs 12.8) |
 | 2-GPU probe, gate variant, p = 0.5 | 15.94 GB peak reserved per GPU (16.6 GB in nvidia-smi), 8.66 GB headroom: **GO**. 11.2 samples/s |
-| 2-GPU probe, gate variant, p = 0 | Same memory, 16.0 samples/s. A 30k-update run is therefore about 24 h |
+| 2-GPU probe, gate variant, p = 0 | Same memory, 16.0 samples/s. With self-past at p = 0.5 (11.2 samples/s) after its ramp, a 30k-update run takes about 24 h |
+| 2-GPU probe with in-training rollouts (`-- task.policy.lazy_eval=false`; 10 official episodes on rank 0) | GPU 0 peaks at 20.6 GB with the training state plus 10 renderers, leaving 5.1 GB headroom: **GO**. 10 episodes take 55 s |
 | Batch-1 bf16 `predict_action` latency (p50) | 184 ms (prefix 39.7, decode 141.6, detokenize 2.8), within the 267 ms budget |
 | Step-0 losses on the full model | `L_AR` 8.53–8.57 (ln 5001 = 8.52); `L_KI` 15.6–17.5 (see the note below) |
 | 2-episode overfit, `p2n_vla`, 3,000 updates, `use_ema=false`, scored on its 506 training windows | Teacher-forced `L_AR` 0.013, token accuracy 0.998; greedy tokens 0.992, exact chunks 0.986; reconstruction MSE 9.3e-4 vs the OAT round-trip floor 7.9e-4 (3.37e-3 vs 3.21e-3 normalized); `predict_action` decodes exactly the greedy tokens |

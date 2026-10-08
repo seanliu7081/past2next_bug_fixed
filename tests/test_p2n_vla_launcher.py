@@ -1,6 +1,7 @@
 """P2N-VLA launcher (M4): config composition and validation, preflight checks, worker entry, eval script."""
 import json
 import os
+import subprocess
 from pathlib import Path
 
 from omegaconf import OmegaConf
@@ -29,15 +30,21 @@ def test_all_three_configs_compose_with_the_full_recipe(variant):
     assert cfg.variant == policy.variant == variant
     assert policy._target_ == launcher.VARIANTS[variant]["target"]
     assert cfg._target_ == "oat.workspace.train_p2n_vla.TrainP2NVLAWorkspace"
-    # batch and length: 8 epochs x 7500 micro-batches / accumulation 2 = 30000 updates at batch 8 x 2 x 2
+    # batch and length: 300 epochs x 200 micro-batches / accumulation 2 = 30000 updates at batch 8 x 2 x 2
+    # (an epoch is 100 updates; in-training rollouts every 50 epochs land on the 5k-update snapshots)
     assert cfg.dataloader.batch_size == 8 and training.gradient_accumulate_every == 2
-    assert training.num_epochs == 8 and training.max_train_steps == 7500 and training.max_optimizer_steps == 30000
+    assert training.num_epochs == 300 and training.max_train_steps == 200 and training.max_optimizer_steps == 30000
     assert cfg.optimizer == {"policy_lr": 5e-5, "new_module_lr": 1e-4, "weight_decay": 1e-10,
                              "betas": [0.9, 0.95], "eps": 1e-8, "fused": None}
     assert training.lr_warmup_steps == 1000 and training.min_lr_ratio == 0.1 and training.max_grad_norm == 1.0
     assert cfg.ema.decay == 0.999 and training.use_ema is True
-    assert training.snapshot_every == 5000 and training.checkpoint_every == 1
-    assert training.val_every == 1 and training.max_val_steps == 200
+    assert training.snapshot_every == 5000 and training.checkpoint_every == 10
+    assert training.val_every == 50 and training.max_val_steps == 200
+    assert training.rollout_every == 50 and training.rollout_at_final is True and training.rollout_seed == 44
+    assert cfg.task.policy.lazy_eval is True  # rollouts are opt-in: task.policy.lazy_eval=false
+    runner = cfg.task.policy.env_runner
+    assert (runner.protocol, runner.n_test, runner.test_start_seed, runner.init_state_offset) == ("official", 500, 3000, 0)
+    assert runner.n_parallel_envs == 10 and runner.max_episode_steps == 550 and runner.n_test_vis == 0
     assert (policy.lora_rank, policy.lora_alpha, policy.adarms_t0, policy.lambda_ki) == (16, 16.0, 0.6, 1.0)
     assert policy.temperature == 0.0 and policy.model_size == "full"
     assert policy.prompt.max_len == 96 and cfg.max_prompt_len == 96
@@ -66,7 +73,7 @@ def test_all_three_configs_compose_with_the_full_recipe(variant):
         assert list(policy.state_history_keys) == list(cfg.task.policy.dataset.state_history_keys)
         assert policy.history_gate_mode == "learned" and policy.history_gate_init == 0.9
     schedule = launcher.expected_schedule(cfg, 124600, 2)
-    assert schedule["batches_per_rank"] == 7500 and schedule["updates_per_epoch"] == 3750
+    assert schedule["batches_per_rank"] == 200 and schedule["updates_per_epoch"] == 100
     assert schedule["planned_optimizer_updates"] == schedule["expected_optimizer_updates"] == 30000
     assert schedule["effective_batch"] == 32 and schedule["cosine_horizon"] == 30000
 
@@ -88,7 +95,7 @@ def test_all_three_configs_compose_with_the_full_recipe(variant):
     ("p2n_vla", "training.lr_warmup_steps=40000", "lr_warmup_steps"),
     ("p2n_vla", "dataloader.drop_last=false", "drop_last"),
     ("p2n_vla", "logging.mode=verbose", "logging.mode"),
-    ("p2n_vla", "task.policy.lazy_eval=false", "rollouts"),
+    ("p2n_vla", "task.policy.lazy_eval=1", "lazy_eval"),
     ("p2n_vla", "training.init_checkpoint=/x.ckpt", "init_checkpoint"),
     ("p2n_vla", "training.resume=true", "resume"),
     ("p2n_vla", "policy.model_size=tiny", "pi05_weights=null"),
@@ -99,6 +106,121 @@ def test_all_three_configs_compose_with_the_full_recipe(variant):
 def test_config_validation_rejects_disagreements(variant, override, message):
     with pytest.raises(ValueError, match=message):
         compose(variant, override)
+
+
+def test_in_training_rollouts_validate_and_plan_the_official_schedule():
+    for variant in ("p2n_vla", "p2n_vla_state_gate"):
+        cfg = compose(variant, "task.policy.lazy_eval=false", "logging.mode=online")
+        plan = launcher.rollout_plan(cfg)
+        assert plan["enabled"] and plan["protocol"] == "official" and plan["n_test"] == 500
+        assert plan["episodes_per_task"] == 50 and plan["episode_seeds"] == [3000, 3499]
+        assert [(point["epoch"], point["optimizer_step"]) for point in plan["rollouts"]] == [
+            (50, 5000), (100, 10000), (150, 15000), (200, 20000), (250, 25000), (300, 30000)]
+        assert launcher.describe(cfg, 2, "out", "dry_run")["rollout"] == plan
+    assert launcher.rollout_plan(compose("p2n_vla")) == {"enabled": False}
+    # a final rollout is appended when num_epochs is not a multiple of rollout_every
+    short = compose("p2n_vla", "task.policy.lazy_eval=false", "training.num_epochs=120")
+    assert [point["epoch"] for point in launcher.rollout_plan(short)["rollouts"]] == [50, 100, 120]
+    for overrides, message in (
+            (("training.rollout_every=0",), "rollout_every"),
+            (("task.policy.env_runner.n_test=505",), "balanced"),
+            (("task.policy.env_runner.init_state_offset=10",), "initial states per task"),
+            (("task.policy.env_runner.n_test_vis=501",), "n_test_vis"),
+            (("task.policy.env_runner.protocol=corrected", "task.policy.env_runner.init_state_offset=1"),
+             "official protocol only"),
+            (("training.rollout_at_final=1",), "rollout_at_final")):
+        with pytest.raises(ValueError, match=message):
+            compose("p2n_vla", "task.policy.lazy_eval=false", *overrides)
+    # corrected-protocol rollouts need no balance (and 40 per task + offset 10 still fits the 50 official states)
+    compose("p2n_vla", "task.policy.lazy_eval=false", "task.policy.env_runner.protocol=corrected",
+            "task.policy.env_runner.n_test=105")
+    compose("p2n_vla", "task.policy.lazy_eval=false", "task.policy.env_runner.n_test=400",
+            "task.policy.env_runner.init_state_offset=10")
+
+
+def test_preflight_checks_wandb_credentials_and_egl_rendering(monkeypatch, tmp_path):
+    online = compose("p2n_vla", "logging.mode=online")
+    monkeypatch.setenv("WANDB_API_KEY", "x" * 40)
+    assert launcher.check_wandb(online)["credentials"] == "WANDB_API_KEY"
+    monkeypatch.delenv("WANDB_API_KEY")
+    monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.netrc
+    monkeypatch.delenv("NETRC", raising=False)
+    with pytest.raises(ValueError, match="wandb login"):
+        launcher.check_wandb(online)
+    (tmp_path / ".netrc").write_text("machine api.wandb.ai\n  login user\n  password " + "y" * 40 + "\n")
+    (tmp_path / ".netrc").chmod(0o644)  # wandb accepts it; the stdlib's default-file permission check must not apply
+    assert launcher.check_wandb(online)["credentials"] == "wandb netrc lookup"
+    # $NETRC and WANDB_BASE_URL are honoured the way wandb itself resolves them
+    other = tmp_path / "other.netrc"
+    other.write_text("machine wandb.example.org\n  login user\n  password " + "z" * 40 + "\n")
+    monkeypatch.setenv("NETRC", str(other))
+    with pytest.raises(ValueError, match="api.wandb.ai"):
+        launcher.check_wandb(online)
+    monkeypatch.setenv("WANDB_BASE_URL", "https://wandb.example.org")
+    assert launcher.check_wandb(online)["host"] == "https://wandb.example.org"
+    # wandb names netrc machines by host:port and expands ~ in $NETRC
+    (tmp_path / "port.netrc").write_text("machine localhost:8080\n  login user\n  password " + "w" * 40 + "\n")
+    monkeypatch.setenv("NETRC", "~/port.netrc")
+    monkeypatch.setenv("WANDB_BASE_URL", "http://localhost:8080")
+    assert launcher.check_wandb(online)["host"] == "http://localhost:8080"
+    monkeypatch.delenv("WANDB_BASE_URL")
+    monkeypatch.setenv("WANDB_IDENTITY_TOKEN_FILE", str(tmp_path / "token"))
+    assert launcher.check_wandb(online)["credentials"] == "WANDB_IDENTITY_TOKEN_FILE"
+    monkeypatch.delenv("WANDB_IDENTITY_TOKEN_FILE")
+    assert launcher.check_wandb(compose("p2n_vla")) == {"mode": "offline"}
+
+    import oat.env_runner.p2n_vla_rollout as rollout
+    assert launcher.check_rollout(compose("p2n_vla")) == {"enabled": False}
+    cfg = compose("p2n_vla", "task.policy.lazy_eval=false")
+    monkeypatch.setenv("MUJOCO_GL", "egl")
+    devices = [{"uuid": "GPU-a", "cuda_ordinal": 0, "egl_device_id": 1}]
+    monkeypatch.setattr(rollout, "probe_egl_renderers", lambda: devices)
+    report = launcher.check_rollout(cfg)
+    assert report["egl_renderers"] == devices and report["plan"]["n_test"] == 500
+
+    def broken():
+        raise subprocess.CalledProcessError(1, ["probe"], stderr="libEGL.so.1: cannot open shared object file")
+    monkeypatch.setattr(rollout, "probe_egl_renderers", broken)
+    with pytest.raises(RuntimeError, match="install-display-drivers"):
+        launcher.check_rollout(cfg)
+
+
+def test_rollout_plan_stops_where_training_stops_and_rejects_empty_plans():
+    # the pilot stops at 4,000 updates = epoch 40, so only the final rollout happens
+    pilot = compose("p2n_vla", "task.policy.lazy_eval=false", "training.max_optimizer_steps=4000")
+    assert [(p["epoch"], p["optimizer_step"]) for p in launcher.rollout_plan(pilot)["rollouts"]] == [(40, 4000)]
+    with pytest.raises(ValueError, match="No in-training rollout"):
+        compose("p2n_vla", "task.policy.lazy_eval=false", "training.rollout_every=400", "training.rollout_at_final=false")
+    with pytest.raises(ValueError, match="max_train_steps"):  # epoch length must be known to plan rollouts
+        compose("p2n_vla", "task.policy.lazy_eval=false", "training.max_train_steps=null")
+    with pytest.raises(ValueError, match="too close"):  # 500 one-episode chunks would outlast the watchdog
+        compose("p2n_vla", "task.policy.lazy_eval=false", "task.policy.env_runner.n_parallel_envs=1")
+    with pytest.raises(ValueError, match="rollout_timeout_minutes"):
+        compose("p2n_vla", "task.policy.lazy_eval=false", "training.rollout_timeout_minutes=130")
+    # a probe-only setting never blocks a training run (the probe rounds its episodes up to a full chunk)
+    compose("p2n_vla", "task.policy.lazy_eval=false", "task.policy.env_runner.n_parallel_envs=20")
+    compose("p2n_vla", "task.policy.lazy_eval=false", "training.probe.rollout_episodes=0")
+    plan = launcher.rollout_plan(compose("p2n_vla", "task.policy.lazy_eval=false"))
+    assert 35 < plan["expected_minutes_per_rollout"] < 45 and plan["timeout_minutes"] == 100
+
+
+def test_resume_warns_when_evaluation_or_logging_settings_change(monkeypatch, capsys):
+    from oat.workspace.train_p2n_vla import TrainP2NVLAWorkspace
+    original = compose("p2n_vla", "task.policy.lazy_eval=false", "logging.mode=online")
+    payload = {"cfg": OmegaConf.to_container(original, resolve=True),
+               "training": {"dataset_split": {"identity": {"train_episode_ids": [1], "validation_episode_ids": [2]}},
+                            "counters": {"epoch": 50}, "world_size": 2}}
+    monkeypatch.setattr(TrainP2NVLAWorkspace, "read_payload", staticmethod(lambda path: payload))
+    monkeypatch.setattr(TrainP2NVLAWorkspace, "validate_resume_payload", staticmethod(lambda *a, **k: None))
+    split = {"train_episode_ids": [1], "validation_episode_ids": [2]}
+    plain = compose("p2n_vla", "training.resume=true", "training.resume_checkpoint=/x/latest.ckpt")
+    warnings = launcher.check_resume(plain, 2, split)["warnings"]
+    assert any("task.policy.lazy_eval=False" in item for item in warnings)
+    assert any("logging.mode=online" in item for item in warnings)
+    assert "WARNING (resume)" in capsys.readouterr().err
+    same = compose("p2n_vla", "training.resume=true", "training.resume_checkpoint=/x/latest.ckpt",
+                   "task.policy.lazy_eval=false", "logging.mode=online")
+    assert launcher.check_resume(same, 2, split)["warnings"] == []
 
 
 def test_tiny_override_is_valid_when_weights_are_unset():
@@ -117,7 +239,7 @@ def test_cli_dry_run_applies_paths_and_overrides(tmp_path, capsys):
     assert summary["assets"]["pi05_weights"] == str(tmp_path / "w.safetensors")
     assert summary["assets"]["spm_path"] == str(tmp_path / "t.model")
     assert summary["logging_mode"] == "online" and summary["output"] == str(tmp_path / "run")
-    assert summary["schedule"]["planned_optimizer_updates"] == 3750
+    assert summary["schedule"]["planned_optimizer_updates"] == 100  # one 100-update epoch
     assert "Configuration resolved and validated only" in capsys.readouterr().out
     resumed = launcher.main(["--variant", "p2n_vla_state_gate", "--dry-run",
                              "--resume", str(tmp_path / "run7/checkpoints/latest.ckpt")])
@@ -186,7 +308,8 @@ def test_light_preflight_on_the_real_dataset_oat_and_assets(tmp_path):
         assert prompts["state_dims"] == 8 and set(prompts["per_uid"]) == {str(uid) for uid in range(30, 40)}
         assert prompts["worst_case_tokens"] <= 96
         assert report["schedule"]["planned_optimizer_updates"] == 30000
-        assert report["schedule"]["windows_seen_per_epoch"] == 120000
+        assert report["schedule"]["windows_seen_per_epoch"] == 3200  # 200 micro-batches x 8 x 2 ranks
+        assert sources["rollout"] == {"enabled": False} and sources["wandb"] == {"mode": "offline"}
 
 
 @pytest.mark.requires_data

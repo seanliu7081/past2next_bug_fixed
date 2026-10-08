@@ -58,12 +58,18 @@ prompt:
 state_history_steps: 8
 state_history_keys: [robot0_eef_pos, robot0_eef_quat, robot0_gripper_qpos]
 
+# In-training evaluation (train_p2n_vla*.yaml with task.policy.lazy_eval=false; rank 0, EMA weights):
+# LIBERO's official protocol, 50 episodes per task = each task's 50 fixed initial states once, episode
+# seeds 3000-3499 -- the same schedule as scripts/evaluate_p2n_vla.py --protocol official --n-test 500
+# --episode-start-seed 3000 (that script overrides these values from its own flags).
 env_runner:
   _target_: oat.env_runner.p2n_new_runner.P2NStateGateNewLiberoRunner
   task_name: libero10
-  protocol: corrected
-  n_test: 100
+  protocol: official
+  n_test: 500
   n_test_vis: 0
+  test_start_seed: 3000
+  init_state_offset: 0
   n_obs_steps: ${n_obs_steps}
   n_action_steps: ${n_action_steps}
   fps: 20

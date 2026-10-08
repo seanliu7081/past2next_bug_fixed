@@ -102,7 +102,9 @@ def test_task_configs_compose_and_resolve(name):
                     n_exec_steps=8, history_padding="zero", return_history_validity=True,
                     prompt_state=LIBERO_PROMPT_STATE)
     runner = dict(task["env_runner"])
-    common_runner = dict(task_name="libero10", protocol="corrected", n_test=100, n_test_vis=0, n_obs_steps=1,
+    # In-training rollouts use LIBERO's official protocol: 50 episodes per task (each fixed initial state once).
+    common_runner = dict(task_name="libero10", protocol="official", n_test=500, n_test_vis=0,
+                         test_start_seed=3000, init_state_offset=0, n_obs_steps=1,
                          n_action_steps=8, fps=20, n_parallel_envs=10, image_size=128,
                          camera_names=["agentview", "robot0_eye_in_hand"], state_ports=list(STATE_KEYS),
                          max_episode_steps=550)

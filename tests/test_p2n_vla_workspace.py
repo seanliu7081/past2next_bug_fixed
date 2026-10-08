@@ -822,7 +822,8 @@ def test_probe_reports_throughput_memory_and_writes_no_checkpoints(tmp_path):
 
 def test_run_config_rejects_unsupported_settings(tmp_path):
     for key, value, message in (("training.init_checkpoint", "/x.ckpt", "init_checkpoint"),
-                                ("task.policy.lazy_eval", False, "rollouts"),
+                                ("task.policy.lazy_eval", False, "rollout_every"),
+                                ("task.policy.lazy_eval", "yes", "lazy_eval must be a boolean"),
                                 ("optimizer.obs_enc_lr", 1e-4, "Unknown optimizer"),
                                 ("logging.mode", "verbose", "logging.mode"),
                                 ("training.gradient_accumulate_every", 0, "gradient_accumulate_every"),
@@ -831,6 +832,369 @@ def test_run_config_rejects_unsupported_settings(tmp_path):
         OmegaConf.update(cfg, key, value, merge=False)
         with pytest.raises(ValueError, match=message):
             Workspace(cfg, output_dir=str(tmp_path)).run()
+
+
+# ------------------------------------------------------------------- in-training rollouts
+class StubRolloutRunner:
+    """Duck-typed LIBERO runner: drives the policy like ``LiberoRunner.run`` (reset, ``predict_action`` under
+    ``torch.inference_mode``, then ``record_executed_actions``) and writes deterministic episode records."""
+
+    events = []
+
+    def __init__(self, output_dir, task_name="libero10", n_test=4, n_test_vis=0, test_start_seed=3000, n_obs_steps=1,
+                 n_action_steps=8, n_parallel_envs=2, protocol="official", init_state_offset=0, max_episode_steps=16,
+                 episode_records_path=None, **kwargs):
+        self.output_dir, self.n_test, self.protocol = output_dir, int(n_test), protocol
+        self.test_start_seed, self.init_state_offset = int(test_start_seed), int(init_state_offset)
+        self.n_parallel_envs, self.episode_records_path = int(n_parallel_envs), episode_records_path
+        self.last_episode_records = []
+        StubRolloutRunner.events.append({"event": "init", "pid": os.getpid(), "n_test": self.n_test,
+                                         "n_action_steps": n_action_steps, "n_obs_steps": n_obs_steps,
+                                         "protocol": protocol, "output_dir": str(output_dir)})
+
+    def run(self, policy, **kwargs):
+        policy.reset()
+        batch = min(self.n_parallel_envs, self.n_test)
+        if callable(getattr(policy, "create_dummy_observation", None)):  # the real P2N-VLA policies
+            dummy = policy.create_dummy_observation(batch_size=batch, device=policy.device)
+            obs = {port: dummy[port] for port in policy.get_observation_ports()}
+        else:
+            obs = {"agentview_rgb": torch.zeros(batch, 1, 3, 8, 8, dtype=torch.uint8, device=policy.device),
+                   "robot0_eef_pos": torch.zeros(batch, 1, 3, device=policy.device),
+                   "task_uid": torch.full((batch, 1, 1), 30.0, device=policy.device)}
+        for _ in range(2):  # two one-chunk episodes: the static obs stays consistent with an empty history
+            policy.reset()
+            with torch.inference_mode():
+                action = policy.predict_action(obs)["action"]
+            policy.record_executed_actions(action.cpu().numpy(), executed_lengths=np.full(batch, action.shape[1]))
+        weight = getattr(policy, "expert", None)
+        weight = weight.weight if weight is not None else next(p for p in policy.parameters() if p.requires_grad)
+        StubRolloutRunner.events.append({"event": "run", "training": policy.training,
+                                         "any_training": any(module.training for module in policy.modules()),
+                                         "grad_enabled": torch.is_grad_enabled(),
+                                         "weight_sum": float(weight.detach().double().sum())})
+        self.last_episode_records = [
+            {"episode_index": i, "task_name": f"TASK_{i % 2}", "task_trial": i // 2,
+             "episode_seed": self.test_start_seed + i, "init_state_id": self.init_state_offset + i // 2,
+             "protocol": self.protocol, "success": i % 3 == 0, "policy_steps": 10 + i} for i in range(self.n_test)]
+        if self.episode_records_path:
+            Path(self.episode_records_path).write_text(
+                "".join(json.dumps(record) + "\n" for record in self.last_episode_records))
+        return {"mean_success_rate": float(np.mean([r["success"] for r in self.last_episode_records]))}
+
+    def close(self):
+        StubRolloutRunner.events.append({"event": "close"})
+
+
+def rollout_config(**overrides):
+    values = {"task.policy.lazy_eval": False, "training.rollout_every": 2, "training.rollout_at_final": True,
+              "training.rollout_seed": 44, "training.num_epochs": 5, "training.max_train_steps": 2,
+              "training.snapshot_every": 0,
+              "task.policy.env_runner": {"_target_": "test_p2n_vla_workspace.StubRolloutRunner",
+                                         "task_name": "libero10", "protocol": "official", "n_test": 6,
+                                         "n_test_vis": 0, "test_start_seed": 3000, "init_state_offset": 0,
+                                         "n_parallel_envs": 2, "max_episode_steps": 16}}
+    values.update(overrides)
+    return stub_config(**values)
+
+
+def test_rollout_due_after_every_n_completed_epochs_and_at_the_end(tmp_path):
+    workspace = Workspace(rollout_config(**{"training.rollout_every": 50, "training.num_epochs": 300}),
+                          output_dir=str(tmp_path))
+    due = [epoch for epoch in range(300) if workspace.rollout_due(epoch, final=epoch == 299)]
+    assert due == [49, 99, 149, 199, 249, 299]  # 1-indexed epochs 50, 100, ..., 300
+    assert workspace.rollout_due(122, final=True)  # a run cut short still ends with a rollout
+    workspace.cfg.training.rollout_at_final = False
+    assert not workspace.rollout_due(122, final=True)
+
+
+def test_in_training_rollouts_cadence_artifacts_and_ema_weights(tmp_path):
+    StubRolloutRunner.events.clear()
+    workspace = run_workspace(rollout_config(), tmp_path)
+    runs = [event for event in StubRolloutRunner.events if event["event"] == "run"]
+    inits = [event for event in StubRolloutRunner.events if event["event"] == "init"]
+    assert len(runs) == len(inits) == 3  # after epochs 2 and 4 (1-indexed) and the final epoch 5
+    assert sum(event["event"] == "close" for event in StubRolloutRunner.events) == 3  # simulators freed each time
+    assert all(event["n_test"] == 6 and event["protocol"] == "official" and event["n_action_steps"] == 8
+               for event in inits)
+    # Eval mode, no grad, EMA weights during the rollout; live weights and train mode afterwards.
+    assert not any(event["training"] or event["any_training"] or event["grad_enabled"] for event in runs)
+    policy = workspace.model
+    assert all(module.training for module in policy.modules())
+    # The rollout scores the snapshot's weights: the EMA rounded to bf16 (the live weights are restored).
+    shadow = workspace.ema.shadow["expert.weight"]
+    assert runs[-1]["weight_sum"] == pytest.approx(float(shadow.to(torch.bfloat16).double().sum()), abs=1e-12)
+    assert abs(runs[-1]["weight_sum"] - float(policy.expert.weight.detach().double().sum())) > 1e-6
+    rollouts = records(tmp_path / "logs.jsonl", "rollout")
+    assert [record["epoch"] for record in rollouts] == [1, 3, 4]  # 0-indexed, as in the epoch records
+    epochs = records(tmp_path / "logs.jsonl", "epoch")
+    assert not any("rollout/success_rate" in record for record in epochs)  # logged before the rollout runs
+    # Each epoch record is logged before the rollout that follows it.
+    lines = [json.loads(line) for line in (tmp_path / "logs.jsonl").read_text().splitlines()]
+    assert [line["event"] for line in lines if line["event"] in ("epoch", "rollout")] == [
+        "epoch", "epoch", "rollout", "epoch", "epoch", "rollout", "epoch", "rollout"]
+    record = rollouts[0]
+    assert record["rollout/success_rate"] == pytest.approx(2 / 6) and record["rollout/trials"] == 6
+    assert record["mean_success_rate"] == record["rollout/success_rate"]
+    assert record["rollout/task/TASK_0"] == pytest.approx(1 / 3) and record["rollout/task/TASK_1"] == pytest.approx(1 / 3)
+    directory = tmp_path / "eval" / f"rollout_epoch-0002_upd-{record['optimizer_step']:06d}"
+    summary = json.loads((directory / "summary.json").read_text())
+    assert summary["successes"] == 2 and summary["trials"] == 6 and summary["epoch"] == 2
+    assert summary["protocol"] == "official" and summary["episode_start_seed"] == 3000 and summary["weights"] == "ema"
+    assert summary["precision"].startswith("bf16")
+    assert summary["renderer"] is None  # CPU run: no EGL renderer to resolve
+    assert len((directory / "episodes.jsonl").read_text().splitlines()) == 6
+    final = json.loads((tmp_path / "training_summary.json").read_text())
+    assert [entry["epoch"] for entry in final["rollouts"]] == [2, 4, 5]
+    assert final["last_rollout"]["epoch"] == 5
+    report = json.loads((tmp_path / "training_report.json").read_text())
+    assert report["rollout"]["enabled"] and report["rollout"]["every_epochs"] == 2 and report["rollout"]["n_test"] == 6
+
+
+def test_rollouts_never_change_the_training_trajectory(tmp_path):
+    """Rollouts run on a forked RNG with python/numpy states restored, so training is bit-identical."""
+    trajectories, weights = [], []
+    for index, overrides in enumerate(({"task.policy.lazy_eval": True}, {})):
+        workspace = run_workspace(rollout_config(**overrides), tmp_path / str(index))
+        trajectories.append([record["train/loss"]
+                             for record in records(tmp_path / str(index) / "logs.jsonl", "train_step")])
+        weights.append(workspace.model.expert.weight.detach().clone())
+    assert trajectories[0] == trajectories[1] and len(trajectories[0]) == 5
+    assert torch.equal(weights[0], weights[1])
+    assert not (tmp_path / "0" / "eval").exists() and len(list((tmp_path / "1" / "eval").iterdir())) == 3
+
+
+def test_no_ema_rollouts_use_the_live_weights_and_restore_modes(tmp_path):
+    StubRolloutRunner.events.clear()
+    workspace = run_workspace(rollout_config(**{"training.use_ema": False, "training.num_epochs": 2}), tmp_path)
+    runs = [event for event in StubRolloutRunner.events if event["event"] == "run"]
+    assert len(runs) == 1 and not runs[0]["any_training"]
+    live = workspace.model.expert.weight.detach()
+    assert runs[0]["weight_sum"] == pytest.approx(float(live.to(torch.bfloat16).double().sum()), abs=1e-12)
+    assert all(module.training for module in workspace.model.modules())
+    summary = json.loads(next((tmp_path / "eval").iterdir()).joinpath("summary.json").read_text())
+    assert summary["weights"] == "model"
+
+
+def test_probe_rolls_out_the_first_episodes_on_rank0(tmp_path):
+    StubRolloutRunner.events.clear()
+    cfg = rollout_config(**{"training.probe.enabled": True, "training.probe.rollout_episodes": 4,
+                            "training.max_train_steps": 4})  # the probe times 2 updates at accumulation 2
+    workspace = run_workspace(cfg, tmp_path)
+    report = workspace.probe_report
+    assert report["rollout"]["rollout/trials"] == 4 and report["rollout"]["rollout/success_rate"] == pytest.approx(0.5)
+    assert report["go_no_go"]["rollout_headroom_gb"] is None  # nvidia-smi is not sampled on CPU
+    assert (tmp_path / "eval" / "rollout_probe" / "summary.json").is_file()
+    assert [event["n_test"] for event in StubRolloutRunner.events if event["event"] == "init"] == [4]
+
+
+class FailingRolloutRunner(StubRolloutRunner):
+    """A simulator worker dies mid-rollout; close() would block forever (AsyncVectorEnv after a worker error)."""
+
+    class _Process:
+        def __init__(self):
+            self.alive, self.killed = True, False
+
+        def is_alive(self):
+            return self.alive
+
+        def kill(self):
+            self.alive, self.killed = False, True
+
+        def terminate(self):
+            self.alive, self.killed = False, True
+
+        def join(self, timeout=None):
+            pass
+
+    processes = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.env = type("Env", (), {})()
+        self.env.processes = [self._Process(), self._Process()]
+        FailingRolloutRunner.processes.extend(self.env.processes)
+
+    def run(self, policy, **kwargs):
+        raise EOFError("simulator worker 3 died")
+
+    def close(self):
+        raise AssertionError("close() must not be called after a failed rollout (it would block)")
+
+
+def test_checkpoint_is_written_before_every_rollout(tmp_path):
+    workspace = run_workspace(rollout_config(**{"training.checkpoint_every": 100}), tmp_path)
+    saved = [record["epoch"] for record in records(tmp_path / "logs.jsonl", "epoch") if "checkpoint" in record]
+    assert saved == [0, 1, 3, 4]  # epoch 0 (cadence), the rollout epochs 1 and 3, and the final epoch
+    assert workspace.completed_optimizer_steps == 5
+
+
+def test_failed_rollout_is_recorded_and_training_continues(tmp_path, capfd):
+    FailingRolloutRunner.processes.clear()
+    cfg = rollout_config(**{"task.policy.env_runner._target_": "test_p2n_vla_workspace.FailingRolloutRunner"})
+    workspace = run_workspace(cfg, tmp_path)  # rollout_failure defaults to continue
+    assert workspace.completed_optimizer_steps == 5  # all epochs trained despite three failed rollouts
+    assert FailingRolloutRunner.processes and all(process.killed for process in FailingRolloutRunner.processes)
+    assert "simulator worker 3 died" in capfd.readouterr().err  # printed before any cleanup
+    rollouts = records(tmp_path / "logs.jsonl", "rollout")
+    assert [record["rollout/failed"] for record in rollouts] == [1, 1, 1]
+    summary = json.loads(Path(rollouts[0]["rollout_dir"], "summary.json").read_text())
+    assert summary["failed"] and "worker 3 died" in summary["error"] and summary["epoch"] == 2
+    assert all(module.training for module in workspace.model.modules())  # modes restored after the failure
+    final = json.loads((tmp_path / "training_summary.json").read_text())
+    assert len(final["rollouts"]) == 3 and final["rollouts"][0]["success_rate"] is None
+    assert all(entry["failed"] for entry in final["rollouts"])
+
+
+def test_failed_rollout_with_raise_kills_the_simulators_and_stops(tmp_path, capfd):
+    FailingRolloutRunner.processes.clear()
+    cfg = rollout_config(**{"task.policy.env_runner._target_": "test_p2n_vla_workspace.FailingRolloutRunner",
+                            "training.rollout_failure": "raise"})
+    with pytest.raises(EOFError, match="worker 3 died"):
+        run_workspace(cfg, tmp_path)
+    assert FailingRolloutRunner.processes and all(process.killed for process in FailingRolloutRunner.processes)
+    assert "simulator worker 3 died" in capfd.readouterr().err
+    # Training up to the failing rollout is safe: its epoch record and resume checkpoint were written first.
+    assert [record["epoch"] for record in records(tmp_path / "logs.jsonl", "epoch")] == [0, 1]
+    assert load(tmp_path / "checkpoints/latest.ckpt")["training"]["counters"]["epoch"] == 2
+
+
+def _hang_forever(connection):
+    import time
+    while True:
+        time.sleep(60)
+
+
+class HangingRolloutRunner(StubRolloutRunner):
+    """A simulator worker that never answers: run() blocks on its pipe until the worker is killed."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        import multiprocessing
+        self.parent, child = multiprocessing.get_context("fork").Pipe()
+        self.worker = multiprocessing.get_context("fork").Process(target=_hang_forever, args=(child,), daemon=True)
+        self.worker.start()
+        child.close()
+
+    def run(self, policy, **kwargs):
+        self.parent.recv()  # blocks until the watchdog kills the worker (EOFError)
+
+    def close(self):
+        pass
+
+
+class ConstructionFailureRunner(StubRolloutRunner):
+    """One simulator fails while the runner is being built, after its siblings were forked."""
+
+    def __init__(self, *args, **kwargs):
+        import multiprocessing
+        ConstructionFailureRunner.workers = [multiprocessing.get_context("fork").Process(
+            target=_hang_forever, args=(None,), daemon=True) for _ in range(2)]
+        for worker in ConstructionFailureRunner.workers:
+            worker.start()
+        raise ConnectionResetError("simulator 2 failed to start")
+
+
+def test_rollout_watchdog_turns_a_hung_simulator_into_a_failed_rollout(tmp_path):
+    cfg = rollout_config(**{"task.policy.env_runner._target_": "test_p2n_vla_workspace.HangingRolloutRunner",
+                            "training.rollout_timeout_minutes": 0.02, "training.num_epochs": 2})
+    import time
+    started = time.monotonic()
+    workspace = run_workspace(cfg, tmp_path)
+    assert time.monotonic() - started < 60 and workspace.completed_optimizer_steps == 2
+    rollout = records(tmp_path / "logs.jsonl", "rollout")[0]
+    assert rollout["rollout/failed"] == 1 and "exceeded" in rollout["rollout_error"]
+
+
+def test_failed_runner_construction_kills_the_already_forked_simulators(tmp_path):
+    cfg = rollout_config(**{"task.policy.env_runner._target_": "test_p2n_vla_workspace.ConstructionFailureRunner",
+                            "training.num_epochs": 2})
+    workspace = run_workspace(cfg, tmp_path)
+    assert workspace.completed_optimizer_steps == 2
+    assert ConstructionFailureRunner.workers and not any(w.is_alive() for w in ConstructionFailureRunner.workers)
+    assert "simulator 2 failed to start" in records(tmp_path / "logs.jsonl", "rollout")[0]["rollout_error"]
+
+
+def test_every_rollout_has_a_snapshot_of_the_weights_it_scored(tmp_path):
+    run_workspace(rollout_config(), tmp_path)  # snapshot_every=0: only the rollout snapshots (and the final one)
+    names = sorted(path.name for path in (tmp_path / "snapshots").iterdir())
+    assert names == ["upd-000002_ema.ckpt", "upd-000004_ema.ckpt", "upd-000005_ema.ckpt"]
+    for directory in sorted((tmp_path / "eval").iterdir()):
+        summary = json.loads((directory / "summary.json").read_text())
+        assert summary["snapshot"].endswith(f"upd-{summary['optimizer_step']:06d}_ema.ckpt")
+
+
+def test_interrupted_rollouts_are_reported(tmp_path, capsys):
+    run_workspace(rollout_config(**{"training.num_epochs": 2}), tmp_path)
+    (tmp_path / "eval" / "rollout_epoch-0004_upd-000004").mkdir()  # as if the run died during that rollout
+    resumed = rollout_config(**{"training.num_epochs": 4, "training.resume": True,
+                                "training.resume_checkpoint": str(tmp_path / "checkpoints/latest.ckpt")})
+    run_workspace(resumed, tmp_path)
+    assert "never finished" in capsys.readouterr().out
+    history = json.loads((tmp_path / "training_summary.json").read_text())["rollouts"]
+    assert [item.get("incomplete", False) for item in history].count(True) == 1
+
+
+def test_close_runner_never_blocks_on_a_stuck_simulator():
+    from oat.env_runner.p2n_vla_rollout import close_runner as _close_runner
+    import threading
+    release = threading.Event()
+
+    class Stuck:
+        def __init__(self):
+            self.env = type("Env", (), {})()
+            self.env.processes = [FailingRolloutRunner._Process()]
+
+        def close(self):
+            release.wait(30)  # a worker that never answers
+
+    runner = Stuck()
+    import time
+    started = time.monotonic()
+    _close_runner(runner, force=False, timeout=0.5)
+    assert time.monotonic() - started < 10 and runner.env.processes[0].killed
+    assert runner.env.closed  # VectorEnv.__del__ must not re-enter a blocking close()
+    release.set()
+    forced = Stuck()
+    _close_runner(forced, force=True)
+    assert forced.env.processes[0].killed
+
+
+def test_snapshot_precision_rounds_like_the_snapshot_and_restores_exactly():
+    from oat.workspace.train_p2n_vla import _snapshot_precision
+    layer = nn.Linear(4, 3)
+    with torch.no_grad():
+        layer.weight.add_(1e-3 * torch.arange(12.0).reshape(3, 4) / 7)
+    before = layer.weight.detach().clone()
+    pointer = layer.weight.data_ptr()
+    with _snapshot_precision(list(layer.named_parameters())):
+        assert torch.equal(layer.weight, before.to(torch.bfloat16).float())
+        assert layer.weight.dtype == torch.float32 and layer.weight.data_ptr() == pointer  # in place, no GPU copy
+    assert layer.weight.data_ptr() == pointer and torch.equal(layer.weight, before)  # the original storage
+
+
+def test_rollout_history_survives_a_resume(tmp_path):
+    first = rollout_config(**{"training.num_epochs": 2})
+    run_workspace(first, tmp_path)
+    resumed = rollout_config(**{"training.num_epochs": 4, "training.resume": True,
+                                "training.resume_checkpoint": str(tmp_path / "checkpoints/latest.ckpt")})
+    run_workspace(resumed, tmp_path)
+    summary = json.loads((tmp_path / "training_summary.json").read_text())
+    assert [entry["epoch"] for entry in summary["rollouts"]] == [2, 4]  # epoch 2 ran before the resume
+
+
+@pytest.mark.slow
+def test_two_process_gloo_ddp_rollouts_run_on_rank0_while_rank1_waits(tmp_path):
+    cfg = rollout_config(**{"training.num_epochs": 3, "training.max_train_steps": 3})
+    output = tmp_path / "run"
+    _torchrun_worker(cfg, output, tmp_path, "rollout")
+    epochs = records(output / "logs.jsonl", "epoch")
+    assert [record["epoch"] for record in records(output / "logs.jsonl", "rollout")] == [1, 2]
+    assert all(record["replica_fingerprint"] is not None for record in epochs)  # replicas stayed identical
+    names = sorted(path.name for path in (output / "eval").iterdir())
+    assert names == ["rollout_epoch-0002_upd-000004", "rollout_epoch-0003_upd-000006"]
+    summary = json.loads((output / "training_summary.json").read_text())
+    assert [entry["epoch"] for entry in summary["rollouts"]] == [2, 3]
 
 
 @pytest.mark.slow
@@ -956,6 +1320,31 @@ def real_tiny_config(variant, zarr_path, *overrides):
     ]
     return launcher.compose_config(variant, "libero", [*settings, *overrides])
 
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("variant", ["p2n_vla", "p2n_vla_state_gate"])
+def test_real_tiny_policy_keeps_training_after_in_training_rollouts(tmp_path, variant):
+    """predict_action runs under the runner's inference_mode between epochs; nothing it caches may leak into
+    the next training step's autograd graph, and the EMA swap must restore the live weights exactly."""
+    _require_real_policy_stack()
+    zarr_path = make_libero_like_zarr(tmp_path / "libero_like.zarr")
+    cfg = real_tiny_config(variant, zarr_path, "training.num_epochs=3", "training.snapshot_every=0",
+                           "task.policy.lazy_eval=false", "training.rollout_every=1",
+                           "task.policy.env_runner.n_test=10")
+    OmegaConf.update(cfg, "task.policy.env_runner._target_", "test_p2n_vla_workspace.StubRolloutRunner")
+    StubRolloutRunner.events.clear()
+    workspace = run_workspace(cfg, tmp_path / "run")
+    runs = [event for event in StubRolloutRunner.events if event["event"] == "run"]
+    assert len(runs) == 3 and not any(event["any_training"] for event in runs)
+    steps = records(tmp_path / "run/logs.jsonl", "train_step")
+    assert [record["optimizer_step"] for record in steps] == [1, 2, 3]
+    assert all(np.isfinite(record["train/loss"]) for record in steps)
+    # The EMA swap restored the live weights: they differ from the EMA shadow after training.
+    name = workspace.ema.names[0]
+    live = dict(workspace.model.named_parameters())[name].detach()
+    assert not torch.equal(live, workspace.ema.shadow[name].to(live.dtype))
+    assert [record["rollout/trials"] for record in records(tmp_path / "run/logs.jsonl", "rollout")] == [10, 10, 10]
 
 def _fixed_eval_batch(dataset, indices=(4, 9)):
     batch = torch.utils.data.default_collate([dataset[index] for index in indices])
