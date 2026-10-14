@@ -1,0 +1,40 @@
+# Full SigLIP/projector + P2N expert tuning; Gemma (including LoRA) stays frozen.
+# The positive KI loss trains vision through the frozen language model.
+defaults:
+  - train_p2n_vla
+  - _self_
+
+name: train_p2n_vla_vision_action
+
+policy:
+  _target_: oat.policy.p2n_vla_vision_action.P2NVLAVisionActionPolicy
+  training_scope: vision_action
+  vision_activation_checkpointing: true
+  spm_path: /workspace/ysk/past2next_bug_fixed/data/pretrained/p2n_vla/paligemma_tokenizer.model
+  tokenizer_checkpoint: /workspace/ysk/past2next_bug_fixed/data/pretrained/p2n_vla/oat_from_upd030000.ckpt
+
+training:
+  # Preserve 100 optimizer updates per epoch when changing accumulation.
+  # Two GPUs x batch 1 x accumulation 16 = effective batch 32.
+  gradient_accumulate_every: 16
+  max_train_steps: ${eval:'100 * ${training.gradient_accumulate_every}'}
+  # Let num_epochs determine the total updates and cosine horizon (no hidden 30k cap).
+  max_optimizer_steps: null
+  val_every: 100
+  rollout_every: 100
+
+dataloader:
+  batch_size: 1
+
+val_dataloader:
+  batch_size: 1
+
+task:
+  policy:
+    lazy_eval: false
+
+logging:
+  mode: online
+  name: ${now:%Y%m%d.%H%M%S}_${variant}_vision_action_${task_name}_seed${seed}
+  tags: ['${variant}', '${task_name}', 'pi05_base', 'oat_so3aug', 'vision_action']
+  group: ${variant}_vision_action_${task_type}
