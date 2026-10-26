@@ -1,0 +1,46 @@
+# @package _global_
+# Matched Diffusion Policy baseline on a DexMimicGen task: same zarr, observations, native action,
+# split (seed 42 / val 0.05), horizon 16 / execute 8 and crop 76 as the past2next arms.
+# The prev-window dataset is reused so windows and normalizers are identical; DP reads only
+# batch['obs'] and batch['action'].
+defaults:
+  - /train_diffpolicy_real_robot
+  - override /task/policy: dexmg/box_cleanup_with_prev_window
+  - _self_
+
+name: train_diffpolicy_dexmg
+past_n: 7
+
+policy:
+  obs_encoder:
+    vision_encoder:
+      crop_shape: [76, 76]
+
+training:
+  # Box: ~3,470 optimizer steps/epoch at batch 64 -> 30 epochs ~ 100k steps (matched budget).
+  num_epochs: 30
+  val_every: 1
+  sample_every: 1
+  checkpoint_every: 5
+  rollout_every: 1000
+  num_demo: 1016
+  offline_validation_reason: held_out_dexmg_episodes
+
+checkpoint:
+  topk:
+    monitor_key: test_reconst_mse
+    mode: min
+    k: 3
+    format_str: 'ep-{epoch:04d}_mse-{test_reconst_mse:.6f}.ckpt'
+  save_last_ckpt: true
+
+logging:
+  project: dexmg
+  mode: offline
+  name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_seed${seed}
+  tags: [diffusion_policy, dexmg, '${task_name}']
+  group: ${task_name}_diffpolicy
+
+hydra:
+  run:
+    dir: output/dexmg/policy/${name}_${task_name}_${now:%Y%m%d_%H%M%S}_seed${seed}

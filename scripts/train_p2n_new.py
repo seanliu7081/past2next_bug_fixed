@@ -48,6 +48,8 @@ def validate_config(cfg, variant, task):
         (True, "libero"): "oat.dataset.zarr_dataset_with_state_history.ZarrDatasetWithStateHistory",
         (False, "real_robot"): "oat.dataset.real_robot_dataset.RealRobotZarrDatasetWithPrevWindow",
         (True, "real_robot"): "oat.dataset.real_robot_state_history.RealRobotZarrDatasetWithStateHistory",
+        (False, "dexmg"): "oat.dataset.real_robot_dataset.RealRobotZarrDatasetWithPrevWindow",
+        (True, "dexmg"): "oat.dataset.real_robot_state_history.RealRobotZarrDatasetWithStateHistory",
     }[gate, task]
     if dataset_target != expected_dataset:
         raise ValueError(f"Variant/task requires dataset {expected_dataset}")
@@ -58,6 +60,12 @@ def validate_config(cfg, variant, task):
     if task == "real_robot":
         if cfg.task.policy.env_runner is not None or not cfg.task.policy.lazy_eval:
             raise ValueError("Real robot uses offline validation and no simulator runner")
+    elif task == "dexmg":
+        expected_runner = "oat.env_runner.dexmg_runner." + (
+            "P2NStateGateNewDexMGRunner" if gate else "P2NNewDexMGRunner")
+        runner = cfg.task.policy.get("env_runner")
+        if runner is None or runner.get("_target_") != expected_runner:
+            raise ValueError(f"DexMimicGen requires {expected_runner} (execution/state-history capabilities)")
     else:
         expected_runner = "P2NStateGateNewLiberoRunner" if gate else "P2NNewLiberoRunner"
         if not cfg.task.policy.env_runner._target_.endswith("." + expected_runner):

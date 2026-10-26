@@ -24,7 +24,7 @@ from scripts.train_p2n_new_convnext_libero10 import configure_training_devices, 
 CONFIG_NAMES = {
     (variant, task): f"experimental/train_{variant}_original_obs_{task}"
     for variant in ("p2n_new", "p2n_state_gate_new")
-    for task in ("libero", "real_robot")
+    for task in ("libero", "real_robot", "dexmg")
 }
 
 
@@ -32,7 +32,7 @@ def compose_config(variant, task, overrides=()):
     from hydra import compose, initialize_config_dir
     from oat.common.hydra_util import register_new_resolvers
     if (variant, task) not in CONFIG_NAMES:
-        raise ValueError("Supported variants are p2n_new/p2n_state_gate_new; tasks are libero/real_robot")
+        raise ValueError("Supported variants are p2n_new/p2n_state_gate_new; tasks are libero/real_robot/dexmg")
     register_new_resolvers()
     with initialize_config_dir(config_dir=str(ROOT / "oat/config"), version_base=None):
         cfg = compose(config_name=CONFIG_NAMES[variant, task], overrides=list(overrides))
@@ -82,15 +82,34 @@ def validate_config(cfg, variant, task):
         if key not in original_obs or original_obs[key] != expected:
             raise ValueError(f"Original encoder requires original_obs_config.{key}={expected!r}")
     crop = original_obs.get("crop_shape")
-    if crop is None or len(crop) != 2 or any(not isinstance(v, int) or isinstance(v, bool) or v < 1 or v >= 128 for v in crop):
-        raise ValueError("original_obs_config.crop_shape must contain two integer sizes in [1,127]")
     rgb = [spec for spec in cfg.shape_meta.obs.values() if spec.type == "rgb"]
-    if len(rgb) != 2 or any(list(spec.shape) != [128, 128, 3] for spec in rgb):
-        raise ValueError("Current task recipes require two 128x128 RGB cameras")
+    if task == "dexmg":
+        # DexMimicGen: the task table fixes the cameras (3 x 84x84 per embodiment) and the
+        # action width comes from the task schema (checked against the tokenizer at construction).
+        from oat.env.dexmg.factory import get_task
+        dex_task = get_task(cfg.task.policy.env_runner.task_name)
+        ports = [f"{camera}_image" for camera in dex_task["cameras"]]
+        if [key for key, spec in cfg.shape_meta.obs.items() if spec.type == "rgb"] != ports:
+            raise ValueError(f"DexMimicGen {dex_task['name']} requires RGB ports {ports} in this order")
+        sizes = {tuple(spec.shape) for spec in rgb}
+        if len(sizes) != 1 or next(iter(sizes))[0] != next(iter(sizes))[1] or next(iter(sizes))[2] != 3:
+            raise ValueError("DexMimicGen RGB ports must share one square HWC shape")
+        side = next(iter(sizes))[0]
+        if crop is None or len(crop) != 2 or any(not isinstance(v, int) or isinstance(v, bool) or v < 1 or v >= side for v in crop):
+            raise ValueError(f"original_obs_config.crop_shape must contain two integer sizes in [1,{side - 1}]")
+        if len(cfg.shape_meta.action.shape) != 1 or int(cfg.shape_meta.action.shape[0]) < 1:
+            raise ValueError("DexMimicGen actions must be one nonempty vector")
+        if "task_uid" not in cfg.shape_meta.obs:
+            raise ValueError("DexMimicGen recipes keep the constant task_uid port")
+    else:
+        if crop is None or len(crop) != 2 or any(not isinstance(v, int) or isinstance(v, bool) or v < 1 or v >= 128 for v in crop):
+            raise ValueError("original_obs_config.crop_shape must contain two integer sizes in [1,127]")
+        if len(rgb) != 2 or any(list(spec.shape) != [128, 128, 3] for spec in rgb):
+            raise ValueError("Current task recipes require two 128x128 RGB cameras")
+        if "task_uid" not in cfg.shape_meta.obs or list(cfg.shape_meta.action.shape) != [7]:
+            raise ValueError("Current task recipes require task_uid and seven-dimensional actions")
     if any(spec.type not in ("rgb", "state") for spec in cfg.shape_meta.obs.values()):
         raise ValueError("Original-fused observations support only RGB and state ports")
-    if "task_uid" not in cfg.shape_meta.obs or list(cfg.shape_meta.action.shape) != [7]:
-        raise ValueError("Current task recipes require task_uid and seven-dimensional actions")
     if not isinstance(cfg.task.policy.lazy_eval, bool):
         raise ValueError("task.policy.lazy_eval must be true or false")
     for name, value in (("dataloader.batch_size", cfg.dataloader.batch_size),
@@ -117,6 +136,11 @@ def validate_config(cfg, variant, task):
 
 
 def evaluation_summary(cfg):
+    if cfg.task_type == "dexmg":
+        return {"kind": "offline", "lazy_eval": cfg.task.policy.lazy_eval,
+                "validation_max_samples": cfg.training.validation_max_samples,
+                "simulator_evaluation": "after training: scripts/eval_dexmg.py (seeded, paired episodes)",
+                "dexmg_task": cfg.task.policy.env_runner.task_name}
     if cfg.task_type == "real_robot":
         return {"kind": "offline", "lazy_eval": cfg.task.policy.lazy_eval,
                 "validation_max_samples": cfg.training.validation_max_samples,
@@ -228,8 +252,10 @@ def boolean(value):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", choices=("p2n_new", "p2n_state_gate_new"), default="p2n_new")
-    parser.add_argument("--task", choices=("libero", "real_robot"), required=True,
-                        help="libero selects LIBERO-10; real_robot selects Nut Washer N77")
+    parser.add_argument("--task", choices=("libero", "real_robot", "dexmg"), required=True,
+                        help="libero selects LIBERO-10; real_robot selects Nut Washer N77; dexmg selects a DexMimicGen task")
+    parser.add_argument("--dexmg-task", "--dexmg_task",
+                        help="DexMimicGen task (oat/config/task/policy/dexmg/<task>_with_prev_window.yaml); --task dexmg only")
     parser.add_argument("--lazy-eval", "--lazy_eval", type=boolean,
                         help="false enables LIBERO rollouts; real_robot always evaluates recorded held-out data")
     parser.add_argument("--num-train-epochs", "--num_train_epochs", "--num-epochs", "--num_epochs", type=int)
@@ -263,6 +289,8 @@ def flag_overrides(args, parser):
         parser.error("--num-processes must be positive")
     if args.task != "libero" and args.parallel_envs is not None:
         parser.error("--parallel-envs is only meaningful for LIBERO")
+    if args.dexmg_task is not None and args.task != "dexmg":
+        parser.error("--dexmg-task requires --task dexmg")
     mapping = ((args.lazy_eval, "task.policy.lazy_eval"),
                (args.num_train_epochs, "training.num_epochs"),
                (args.batch_size, "dataloader.batch_size"),
@@ -278,6 +306,8 @@ def flag_overrides(args, parser):
                (args.tokenizer, "policy.tokenizer_checkpoint"),
                (args.dataset, "task.policy.dataset.zarr_path"))
     generated = [f"{key}={json.dumps(value)}" for value, key in mapping if value is not None]
+    if args.dexmg_task is not None:
+        generated.insert(0, f"task/policy=dexmg/{args.dexmg_task}_with_prev_window")
     if args.num_workers == 0:
         generated.append("dataloader.persistent_workers=false")
     if args.val_num_workers == 0:

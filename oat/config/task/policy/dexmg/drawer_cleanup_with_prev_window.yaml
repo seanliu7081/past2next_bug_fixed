@@ -1,0 +1,91 @@
+# DexMimicGen TwoArmDrawerCleanup (PandaDexRH + PandaDexLH), single task, native 24-d action
+# [R dpos3, R daxis-angle3, R hand6, L dpos3, L daxis-angle3, L hand6]. robot0 = right arm.
+# Images are the stored upright 84x84 frames; rot6d = first two rows of R from eef_quat_site.
+# The policy dataset must share zarr_path / action_key / seed / val_ratio with its tokenizer.
+name: dexmg_drawer_cleanup
+task_name: dexmg_drawer_cleanup
+task_uids: [1]
+lazy_eval: true
+
+shape_meta: &shape_meta
+  obs:
+    agentview_image:
+      shape: [84, 84, 3]
+      type: rgb
+    robot0_eye_in_hand_image:
+      shape: [84, 84, 3]
+      type: rgb
+    robot1_eye_in_hand_image:
+      shape: [84, 84, 3]
+      type: rgb
+    robot0_eef_pos:
+      shape: [3]
+      type: state
+    robot0_eef_rot6d:
+      shape: [6]
+      type: state
+    robot0_gripper_qpos:
+      shape: [12]
+      type: state
+    robot1_eef_pos:
+      shape: [3]
+      type: state
+    robot1_eef_rot6d:
+      shape: [6]
+      type: state
+    robot1_gripper_qpos:
+      shape: [12]
+      type: state
+    task_uid:
+      shape: [1]
+      type: state
+  action:
+    shape: [24]
+
+env_runner:
+  _target_: oat.env_runner.dexmg_runner.DexMGRunner
+  task_name: drawer_cleanup
+  zarr_path: /workspace/ysk/past2next_bug_fixed/data/dexmg/drawer_cleanup_N1026.zarr
+  n_test: 200
+  n_test_vis: 4
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 20
+  n_parallel_envs: 25
+  image_size: 84
+  state_ports:
+    - robot0_eef_pos
+    - robot0_eef_rot6d
+    - robot0_gripper_qpos
+    - robot1_eef_pos
+    - robot1_eef_rot6d
+    - robot1_gripper_qpos
+  max_episode_steps: 550
+  # EGL indices of the allowed GPUs (smi 0,1,4,5 -> EGL 3,2,7,6); default renders on smi GPU 5.
+  egl_device_ids: [6]
+
+dataset:
+  _target_: oat.dataset.real_robot_dataset.RealRobotZarrDatasetWithPrevWindow
+  zarr_path: /workspace/ysk/past2next_bug_fixed/data/dexmg/drawer_cleanup_N1026.zarr
+  obs_keys:
+    - agentview_image
+    - robot0_eye_in_hand_image
+    - robot1_eye_in_hand_image
+    - robot0_eef_pos
+    - robot0_eef_rot6d
+    - robot0_gripper_qpos
+    - robot1_eef_pos
+    - robot1_eef_rot6d
+    - robot1_gripper_qpos
+    - task_uid
+  action_key: action
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${horizon}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null
+  past_n: ${past_n}
+  # Execution stride (8), independent of the predicted horizon (16).
+  n_exec_steps: ${n_action_steps}
+  history_padding: zero
+  return_history_validity: true

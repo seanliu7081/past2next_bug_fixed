@@ -1,0 +1,45 @@
+# @package _global_
+# R1 (self-generated past) on a DexMimicGen task. Select the task with
+#   override /task/policy: dexmg/<task>_with_prev_window   (default: Box Cleanup)
+# and pass policy.action_tokenizer.checkpoint=<frozen stage-1 tokenizer of the same zarr/action_key>.
+# Training is offline (lazy_eval); success rates come from scripts/eval_dexmg.py afterwards.
+defaults:
+  - /train_past2next_self_past
+  - override /task/policy: dexmg/box_cleanup_with_prev_window
+  - _self_
+
+name: train_past2next_self_past_dexmg
+
+policy:
+  action_tokenizer:
+    checkpoint: ???
+
+training:
+  # Box: ~3,470 optimizer steps/epoch at batch 64 -> 30 epochs ~ 100k steps.
+  num_epochs: 30
+  val_every: 1
+  sample_every: 1
+  checkpoint_every: 5
+  rollout_every: 1000
+  num_demo: 1016
+  validate_generated_history: true
+  offline_validation_enabled: true
+  offline_validation_reason: held_out_dexmg_episodes
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 3
+    format_str: ep-{epoch:04d}_val-{val_loss:.6f}.ckpt
+  save_last_ckpt: true
+
+logging:
+  project: dexmg
+  mode: offline
+  name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_seed${seed}
+  tags: ['${name}', '${task_name}', 'dexmg']
+
+hydra:
+  run:
+    dir: output/dexmg/policy/${name}_${task_name}_${now:%Y%m%d_%H%M%S}_seed${seed}

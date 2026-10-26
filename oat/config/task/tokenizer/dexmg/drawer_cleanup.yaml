@@ -1,0 +1,21 @@
+# Stage 1 tokenizer for DexMimicGen TwoArmDrawerCleanup, native 24-d action:
+# [R dpos3, R daxis-angle3, R hand6, L dpos3, L daxis-angle3, L hand6] (OSC delta + absolute hand targets).
+# Use with oattok.yaml (no SO3 augmentation: the so3aug recipe rotates only [3:6], one arm).
+# seed/val_ratio are literals so policy runs with other training seeds keep the same split.
+name: dexmg_drawer_cleanup
+task_name: dexmg_drawer_cleanup
+
+shape_meta:
+  action:
+    shape: [24]
+
+dataset:
+  _target_: oat.dataset.real_robot_dataset.RealRobotZarrDataset
+  zarr_path: /workspace/ysk/past2next_bug_fixed/data/dexmg/drawer_cleanup_N1026.zarr
+  obs_keys: []
+  action_key: action
+  n_obs_steps: 0
+  n_action_steps: ${horizon}
+  seed: 42
+  val_ratio: 0.05
+  max_train_episodes: null

@@ -1,0 +1,52 @@
+# @package _global_
+# R2: P2N decoder with the original fused ResNet observations on a DexMimicGen task.
+# Launch through scripts/train_p2n_new_original_obs.py --task dexmg --dexmg-task <task>
+# with --tokenizer <frozen stage-1 OAT of the same zarr/action_key/split> and --num-demo.
+defaults:
+- /train_p2n_new_original_obs
+- override /task/policy: dexmg/box_cleanup_with_prev_window
+- _self_
+name: train_p2n_new_original_obs_dexmg
+variant: p2n_new
+task_type: dexmg
+policy:
+  tokenizer_checkpoint: ???
+  # Generate every previous window of the batch in one call (as the LIBERO original-obs run does
+  # with 128); the default 4 runs 16 sequential decodes per step (~3.2 s/step measured on Box).
+  self_past_chunk_size: 64
+  original_obs_config:
+    # 84x84 DexMimicGen frames; same crop as DexMimicGen's BC-RNN and the R1 recipe.
+    crop_shape: [76, 76]
+training:
+  num_demo: 1016
+  # Single GPU at batch 64: Box has ~3,470 optimizer steps/epoch -> 30 epochs ~ 100k steps.
+  num_epochs: 30
+  gradient_accumulate_every: 1
+  val_every: 1
+  sample_every: 1
+  checkpoint_every: 5
+  snapshot_every: 5
+  rollout_every: 1000
+  offline_validation_reason: held_out_dexmg_episodes
+dataloader:
+  batch_size: 64
+val_dataloader:
+  batch_size: 64
+task:
+  policy:
+    lazy_eval: true
+    dataset:
+      val_ratio: 0.05
+    env_runner:
+      _target_: oat.env_runner.dexmg_runner.P2NNewDexMGRunner
+logging:
+  project: dexmg
+  mode: offline
+  tags:
+  - ${variant}
+  - ${task_name}
+  - original_fused
+  - dexmg
+hydra:
+  run:
+    dir: output/dexmg/policy/${variant}_original_obs_${task_name}_${now:%Y%m%d_%H%M%S}_seed${seed}

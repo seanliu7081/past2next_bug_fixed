@@ -1,0 +1,66 @@
+# @package _global_
+# R1g: self-generated past + measured-state history gate (Past2Next state-history gate recipe,
+# rot6d geometry) on a DexMimicGen task. Keeps the gate recipe's own hyperparameters
+# (8 layers, temperature 0, cosine lr 1e-5); only data, crop, keys and checkpointing change.
+# Pass policy.action_tokenizer.checkpoint=<frozen stage-1 tokenizer of the same zarr/action_key>.
+defaults:
+  - /experimental/train_past2next_state_history_gate
+  - override /task/policy: dexmg/box_cleanup_with_prev_window
+  - _self_
+
+name: train_past2next_state_history_gate_dexmg
+state_history_keys: [robot0_eef_pos, robot0_eef_rot6d, robot0_gripper_qpos,
+                     robot1_eef_pos, robot1_eef_rot6d, robot1_gripper_qpos]
+
+policy:
+  _target_: oat.policy.past2next_state_history_gate_real_robot.Past2NextRealRobotStateHistoryGatePolicy
+  rotation_6d_layout: rows
+  obs_encoder:
+    vision_encoder:
+      crop_shape: [76, 76]
+  action_tokenizer:
+    checkpoint: ???
+
+training:
+  # Box: ~3,470 optimizer steps/epoch at batch 64 -> 30 epochs ~ 100k steps (same budget as R1).
+  num_epochs: 30
+  val_every: 1
+  sample_every: 1
+  checkpoint_every: 5
+  snapshot_every: 0
+  rollout_every: 1000
+  num_demo: 1016
+  offline_validation_enabled: true
+  offline_validation_reason: held_out_dexmg_episodes
+
+task:
+  policy:
+    lazy_eval: true
+    dataset:
+      _target_: oat.dataset.real_robot_state_history.RealRobotZarrDatasetWithStateHistory
+      state_history_steps: ${state_history_steps}
+      state_history_keys: ${state_history_keys}
+      history_padding: zero
+      return_history_validity: true
+    env_runner:
+      _target_: oat.env_runner.dexmg_runner.DexMGStateHistoryRunner
+      state_history_steps: ${state_history_steps}
+      state_history_keys: ${state_history_keys}
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 3
+    format_str: ep-{epoch:04d}_val-{val_loss:.6f}.ckpt
+  save_last_ckpt: true
+
+logging:
+  project: dexmg
+  mode: offline
+  name: ${now:%Y%m%d.%H%M%S}_${name}_${task_name}_${policy.history_gate_mode}_seed${seed}
+  tags: ['${name}', '${task_name}', 'state_history_gate', 'dexmg', '${policy.history_gate_mode}']
+
+hydra:
+  run:
+    dir: output/dexmg/policy/${name}_${task_name}_${policy.history_gate_mode}_${now:%Y%m%d_%H%M%S}_seed${seed}
