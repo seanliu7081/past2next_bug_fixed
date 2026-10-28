@@ -31,6 +31,9 @@ offline-validation split metadata, atomic saves, capability routing). Difference
   at snapshot precision (bf16), and a snapshot exists for every rollout step. Training RNG streams, live
   weights and module modes are restored exactly.
   Otherwise, evaluate snapshots with ``scripts/evaluate_p2n_vla.py``.
+- ``training.keep_snapshots=best`` (needs rollouts and ``snapshot_every=0``) keeps only the snapshot of the
+  best rollout so far (highest success rate, the earlier on ties) plus those of failed or interrupted
+  rollouts, and names it in ``snapshots/best.json``; ``checkpoints/latest.ckpt`` holds the latest weights.
 """
 from __future__ import annotations
 
@@ -57,6 +60,7 @@ import numbers
 import os
 import pathlib
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -89,7 +93,7 @@ register_new_resolvers()
 
 CHECKPOINT_FORMAT = "p2n_vla_checkpoint_v1"
 POLICY_FAMILY = "p2n_vla"
-VARIANTS = ("p2n_vla", "p2n_vla_state_gate", "pi05_ki_flow")
+VARIANTS = ("p2n_vla", "p2n_vla_state_gate", "pi05_ki_flow", "pi05_past")
 CLIP_GROUP_NAMES = ("ar", "ki")
 OPTIMIZER_GROUP_NAMES = ("pretrained", "new")
 OPTIMIZER_KEYS = ("policy_lr", "new_module_lr", "weight_decay", "betas", "eps", "fused")
@@ -100,7 +104,8 @@ RESUME_TRAINING_KEYS = ("gradient_accumulate_every", "max_train_steps", "max_opt
 RESUME_TOP_LEVEL_KEYS = ("variant", "task_type", "horizon", "n_action_steps", "n_obs_steps", "past_n")
 SOURCE_FILES = ("oat/workspace/train_p2n_vla.py", "oat/model/common/trainable_ema.py",
                 "scripts/train_p2n_vla.py", "oat/config/train_p2n_vla.yaml",
-                "oat/config/train_p2n_vla_state_gate.yaml", "oat/config/train_pi05_ki_flow.yaml")
+                "oat/config/train_p2n_vla_state_gate.yaml", "oat/config/train_pi05_ki_flow.yaml",
+                "oat/config/train_pi05_past.yaml")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 GIB = float(2 ** 30)
 
@@ -342,6 +347,63 @@ def clip_gradients_per_group(groups: Mapping[str, Sequence[torch.Tensor]], max_n
     return norms
 
 
+def park_optimizer_state(optimizer, device) -> List[Tuple[Dict[str, Any], str, torch.device]]:
+    """Move the optimizer's per-parameter tensors on ``device`` to the host (exact copies); returns the slots
+    ``restore_optimizer_state`` brings back. Frees the AdamW state's GPU memory while nothing steps."""
+    if device.type == "cuda" and device.index is None:  # a single-process run: accelerate's device is "cuda"
+        device = torch.device("cuda", torch.cuda.current_device())
+    parked = []
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor) and value.ndim and value.device == device:
+                state[key] = value.to("cpu")
+                parked.append((state, key, value.device))
+    return parked
+
+
+def restore_optimizer_state(parked) -> None:
+    for state, key, home in parked:
+        state[key] = state[key].to(home)
+
+
+def rebuild_ddp_buckets_early(model, optimizer, device, pause_seconds=0.05, max_rounds=40) -> bool:
+    """Run DDP's one-time gradient-bucket rebuild before the optimizer step instead of in the next forward.
+
+    DDP rebuilds its buckets once, at the first forward after the first synchronised backward, and
+    holds the old and new buckets together meanwhile: an extra fp32 gradient copy on top of the AdamW
+    state (3.3 GiB for Pi05_past, the peak of the whole run). Here the rebuild runs while AdamW keeps no
+    GPU state: before the first step creates it, or with a resumed state parked on the host. NCCL keeps
+    the old buckets referenced until its watchdog hands them back (~0.1 s) and the next collective on
+    this thread drops them, so on CUDA this waits for that before the state returns.
+
+    Gradients are copied into the new buckets, whose order is the one DDP would pick, so training is
+    unchanged. Every rank must call this at the same update: the rebuild broadcasts the bucket order and
+    the wait ends by all-reduce. Returns whether a rebuild happened.
+    """
+    reducer = getattr(model, "reducer", None)
+    if reducer is None or getattr(model, "_has_rebuilt_buckets", True) or getattr(model, "static_graph", False):
+        return False
+    cuda = device.type == "cuda"
+    parked = []
+    if cuda:
+        parked = park_optimizer_state(optimizer, device)
+        settled = torch.cuda.memory_allocated(device)  # new buckets replace old ones: back to this level
+    rebuilt = bool(reducer._rebuild_buckets())  # the call DDP's forward and join hook make
+    if rebuilt:
+        model._has_rebuilt_buckets = True
+    if cuda:
+        if rebuilt:
+            flag = torch.zeros((), dtype=torch.int32, device=device)
+            for _ in range(max_rounds):
+                flag.fill_(int(torch.cuda.memory_allocated(device) <= settled + 64 * 2 ** 20))
+                torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+                if bool(flag.item()):
+                    break
+                time.sleep(pause_seconds)
+        restore_optimizer_state(parked)
+    return rebuilt
+
+
 def validate_parameter_partition(policy, optimizer):
     """Check the M3 ownership contract; returns (named trainable parameters, clip groups).
 
@@ -528,6 +590,14 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
             if not 0 < timeout < 120:
                 raise ValueError("training.rollout_timeout_minutes must lie in (0, 120): the other ranks wait in a "
                                  "barrier bounded by the 2 h process-group timeout")
+        keep = training.get("keep_snapshots", "all")
+        if keep not in ("all", "best"):
+            raise ValueError("training.keep_snapshots must be all or best")
+        if keep == "best" and (lazy_eval or int(training.get("snapshot_every", 0) or 0)
+                               or not training.get("keep_resume_checkpoint", False)):
+            raise ValueError("training.keep_snapshots=best ranks the rollout snapshots and keeps the latest weights "
+                             "in checkpoints/latest.ckpt: it needs task.policy.lazy_eval=false, "
+                             "training.snapshot_every=0 and training.keep_resume_checkpoint=true")
         for key in ("num_epochs", "gradient_accumulate_every", "checkpoint_every", "val_every"):
             _positive_int(training.get(key), f"training.{key}")
         _positive_int(training.get("log_every", 1), "training.log_every")
@@ -618,6 +688,25 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
         for key in RESUME_TRAINING_KEYS:
             if _plain(cfg.training.get(key)) != _plain(saved.training.get(key)):
                 raise ValueError(f"Resume training recipe mismatch: training.{key}")
+        keep, kept = cfg.training.get("keep_snapshots", "all"), saved.training.get("keep_snapshots", "all")
+        if keep != kept:
+            raise ValueError(f"Resume cannot change training.keep_snapshots ({kept} -> {keep}): best deletes "
+                             "snapshots that all keeps")
+        if keep == "best":
+            # Rollouts before and after the resume are ranked against each other: they must be alike.
+            pairs = [(f"training.{key}", cfg.training.get(key), saved.training.get(key))
+                     for key in ("rollout_every", "snapshot_every", "rollout_seed")]
+            pairs.append(("task.policy.lazy_eval", cfg.task.policy.get("lazy_eval"),
+                          saved.task.policy.get("lazy_eval")))
+            new_runner = _plain(cfg.task.policy.get("env_runner")) or {}
+            old_runner = _plain(saved.task.policy.get("env_runner")) or {}
+            pairs += [(f"task.policy.env_runner.{key}", new_runner.get(key), old_runner.get(key))
+                      for key in ("protocol", "n_test", "test_start_seed", "init_state_offset",
+                                  "max_episode_steps", "n_parallel_envs")]
+            for label, now, then in pairs:
+                if _plain(now) != _plain(then):
+                    raise ValueError(f"Resume with keep_snapshots=best cannot change {label} ({then!r} -> {now!r}): "
+                                     "the best snapshot is chosen across all rollouts of the run")
         if int(cfg.dataloader.batch_size) != int(saved.dataloader.batch_size):
             raise ValueError("Resume cannot change the per-rank micro-batch")
         return payload
@@ -901,6 +990,8 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
     def _optimizer_update(self, run: _Run, max_norm):
         """Clip per group, step if every norm is finite on every rank, then advance counters."""
         accelerator = run.accelerator
+        if accelerator.num_processes > 1:
+            rebuild_ddp_buckets_early(run.model, run.optimizer.optimizer, accelerator.device)
         norms = clip_gradients_per_group(run.clip, max_norm)
         finite = torch.ones((), dtype=torch.int32, device=accelerator.device)
         for value in norms.values():
@@ -1146,9 +1237,74 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
             history.append({"tag": summary.get("tag"), "epoch": summary.get("epoch"),
                             "optimizer_step": summary.get("optimizer_step"),
                             "success_rate": summary.get("success_rate"), "trials": summary.get("trials"),
-                            "failed": bool(summary.get("failed", False)), "dir": str(path.parent)})
+                            "failed": bool(summary.get("failed", False)), "dir": str(path.parent),
+                            "protocol": summary.get("protocol"),
+                            "episode_start_seed": summary.get("episode_start_seed")})
         return sorted(history, key=lambda item: (item["optimizer_step"] if item["optimizer_step"] is not None
                                                  else -1, item["dir"]))
+
+    def _keep_best_snapshot(self, output) -> Optional[Dict[str, Any]]:
+        """``keep_snapshots=best``: rank each step by its newest rollout attempt (an epoch replayed after a resume
+        re-saves the step's snapshot and writes ``rollout_..._upd-NNNNNN_rK``). A step counts only if that attempt
+        scored with the current protocol, episode count and seeds and its snapshot exists. Keep the best (highest
+        success rate, the earlier step on ties), delete the other counted snapshots and name the best in
+        ``snapshots/best.json``. Failed, interrupted or differently evaluated steps and any other snapshot are
+        never deleted."""
+        runner = self.cfg.task.policy.env_runner
+        current = (runner.get("protocol"), int(runner.get("n_test")), runner.get("test_start_seed"))
+        newest: Dict[int, Tuple[int, Dict[str, Any]]] = {}
+        for item in self._rollout_history(output):
+            found = re.search(r"upd-(\d+)(?:_r(\d+))?$", pathlib.Path(item["dir"]).name)
+            if found is None:
+                continue
+            step, attempt = int(found.group(1)), int(found.group(2) or 0)
+            if step not in newest or attempt > newest[step][0]:
+                newest[step] = (attempt, item)
+        ranked = {step: item for step, (_, item) in newest.items()
+                  if not item.get("failed") and not item.get("incomplete") and item.get("success_rate") is not None
+                  and (item.get("protocol"), item.get("trials"), item.get("episode_start_seed")) == current
+                  and self.snapshot_path(step).is_file()}
+        directory = pathlib.Path(output) / "snapshots"
+        if not ranked:
+            (directory / "best.json").unlink(missing_ok=True)  # nothing scored still exists: no stale claim
+            return None
+        step, item = max(ranked.items(), key=lambda pair: (pair[1]["success_rate"], -pair[0]))
+        for other in ranked:
+            if other != step:
+                self.snapshot_path(other).unlink()
+        best = {"optimizer_step": step, "epoch": item["epoch"], "success_rate": item["success_rate"],
+                "trials": item["trials"], "file": self.snapshot_path(step).name,
+                "snapshot": str(self.snapshot_path(step)), "rollout_dir": item["dir"]}
+        (directory / "best.json").write_text(json.dumps(best, indent=2, sort_keys=True) + "\n")
+        return best
+
+    def _resume_warnings(self, output, epochs: int, steps: int) -> List[str]:
+        """What a resume after ``epochs`` completed epochs (``steps`` updates) does not redo: a step whose newest
+        rollout attempt never finished, and a rollout due after the checkpoint's own epoch that never started (the
+        run stopped between that checkpoint and its rollout; only ``checkpoints/latest.ckpt`` holds those weights)."""
+        newest: Dict[int, Tuple[int, Dict[str, Any]]] = {}
+        started = set()
+        for item in self._rollout_history(output):
+            found = re.search(r"epoch-(\d+)_upd-(\d+)(?:_r(\d+))?$", pathlib.Path(item["dir"]).name)
+            if found is None:
+                continue
+            started.add(int(found.group(1)))
+            step, attempt = int(found.group(2)), int(found.group(3) or 0)
+            if step not in newest or attempt > newest[step][0]:
+                newest[step] = (attempt, item)
+        warnings = [f"rollout {item['dir']} never finished (the run stopped during it); re-evaluate that step's "
+                    "snapshot with scripts/evaluate_p2n_vla.py" for _, (_, item) in sorted(newest.items())
+                    if item.get("incomplete")]
+        training = self.cfg.training
+        if epochs > 0 and not self.cfg.task.policy.get("lazy_eval", True):
+            max_steps = training.get("max_optimizer_steps")
+            finished = epochs >= int(training.num_epochs) or (max_steps is not None and steps >= int(max_steps))
+            if self.rollout_due(epochs - 1, finished) and epochs not in started:
+                warnings.append(f"the rollout due after epoch {epochs} (update {steps}) never started (the run "
+                                "stopped before it); checkpoints/latest.ckpt holds those weights until the run "
+                                "writes its next checkpoint: evaluate it with scripts/evaluate_p2n_vla.py "
+                                "--snapshot <run>/checkpoints/latest.ckpt --weights model")
+        return warnings
 
     def _rollout_dir(self, tag: str) -> pathlib.Path:
         base = pathlib.Path(self.output_dir) / "eval" / f"rollout_{tag}"
@@ -1189,8 +1345,11 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                                                n_obs_steps=policy.n_obs_steps, output_dir=output, n_test=n_test)
             runner_cfg = scope_runner_to_renderer(runner_cfg, self.rollout_renderer)
             uuid = str(torch.cuda.get_device_properties(device).uuid) if device.type == "cuda" else None
+            parked = []
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
+                # The ten simulators' EGL renderers need ~5 GB on this GPU: the AdamW state waits on the host.
+                parked = park_optimizer_state(run.optimizer.optimizer, device)
                 torch.cuda.empty_cache()  # hand cached activation blocks back to the driver for the renderers
             python_state, numpy_state = random.getstate(), np.random.get_state()
             fork_devices = [device.index if device.index is not None else torch.cuda.current_device()] \
@@ -1257,6 +1416,7 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                 policy.reset()  # drop rollout buffers created under the runner's inference_mode
                 random.setstate(python_state)
                 np.random.set_state(numpy_state)
+                restore_optimizer_state(parked)  # the renderers are gone
             if error_text is not None:
                 runner = log_data = records = None
                 gc.collect()
@@ -1494,6 +1654,25 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                     max_steps is not None and int(counters["completed_optimizer_steps"]) >= int(max_steps)):
                 accelerator.print(f"Checkpoint already completed {counters['epoch']} epochs / "
                                   f"{counters['completed_optimizer_steps']} updates; nothing to do.")
+                if accelerator.is_main_process:
+                    # A run stopped during its final rollout: that rollout is not redone, so say so and still
+                    # write the summary the finished run would have written.
+                    output = pathlib.Path(self.output_dir)
+                    output.mkdir(parents=True, exist_ok=True)
+                    history = self._rollout_history(output)
+                    for warning in self._resume_warnings(output, int(counters["epoch"]),
+                                                         int(counters["completed_optimizer_steps"])):
+                        accelerator.print(f"WARNING: {warning}")
+                    path = output / "training_summary.json"
+                    try:  # a run that finished normally keeps its fuller summary
+                        summary = json.loads(path.read_text())
+                    except (OSError, ValueError):
+                        summary = {"variant": cfg.variant, "epochs": int(counters["epoch"]),
+                                   "optimizer_steps": int(counters["completed_optimizer_steps"]),
+                                   "resume_checkpoint_kept": pathlib.Path(training.resume_checkpoint).exists()}
+                    summary.update({"snapshots": sorted(str(item) for item in (output / "snapshots").glob("upd-*.ckpt")),
+                                    "rollouts": history, "completed_before_this_resume": True})
+                    path.write_text(json.dumps(_sanitize(summary), indent=2) + "\n")
                 return None
 
         # 1-2. policy on its device
@@ -1513,7 +1692,18 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
         train_loader = self._make_train_loader(dataset, cfg, self.world_size)
         val_loader, val_windows = self._make_val_loader(val_dataset, cfg, self.world_size)
         # 5. prepare (DDP broadcasts rank 0's parameters here)
+        zeroed = payload is not None and accelerator.num_processes > 1
+        if zeroed:
+            # Resume: the AdamW state is already on the GPU. Gradients defined before DDP becomes views of its
+            # buckets, so the first update's no_sync micro-steps accumulate in place instead of into a second
+            # fp32 copy (+3.3 GiB for Pi05_past, more than a 24 GB GPU has left). The gradient-coverage check
+            # passed when the run started; zeros keep every update bitwise unchanged.
+            for _, parameter in named:
+                if parameter.grad is None:
+                    parameter.grad = torch.zeros_like(parameter)
         model, optimizer, train_loader, val_loader = accelerator.prepare(policy, optimizer, train_loader, val_loader)
+        if zeroed and device.type == "cuda":
+            torch.cuda.empty_cache()  # the zeros were copied into the buckets; release their cached memory
         if accelerator.unwrap_model(model) is not policy:
             raise RuntimeError("Accelerate replaced the policy object; the EMA must track the live module")
         self.model, self.optimizer = policy, optimizer
@@ -1651,10 +1841,8 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
             # After every constructor, DDP broadcast and tracker; before the first draw.
             self._restore_rng(accelerator.process_index, accelerator.num_processes, device)
             if accelerator.is_main_process:
-                for item in self._rollout_history(output):
-                    if item.get("incomplete"):
-                        accelerator.print(f"WARNING: rollout {item['dir']} never finished (the run stopped during "
-                                          f"it); re-evaluate that step's snapshot with scripts/evaluate_p2n_vla.py")
+                for warning in self._resume_warnings(output, self.epoch, self.completed_optimizer_steps):
+                    accelerator.print(f"WARNING: {warning}")
 
         num_epochs = int(training.num_epochs)
         keep_resume = bool(training.get("keep_resume_checkpoint", False))
@@ -1686,7 +1874,8 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                 if checkpoint_due and (keep_resume or not final):
                     record["checkpoint"] = self.save_checkpoint()
                 if final:
-                    if self.last_snapshot_step != self.completed_optimizer_steps:
+                    if (self.last_snapshot_step != self.completed_optimizer_steps
+                            or not self.snapshot_path().is_file()):  # keep_snapshots=best may have deleted it
                         record["snapshot"] = self.save_snapshot()
                     latest = self.get_checkpoint_path()
                     if not keep_resume and latest.exists():
@@ -1701,7 +1890,8 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                 accelerator.print(json.dumps(_sanitize(record)))
             # After this epoch's checkpoint, snapshot and record: the summary links the snapshot it scored (the
             # epoch ends on a snapshot step), and a crash during the rollout loses neither training nor logs.
-            if rollout_due and self.last_snapshot_step != self.completed_optimizer_steps:
+            if rollout_due and (self.last_snapshot_step != self.completed_optimizer_steps
+                                or not self.snapshot_path().is_file()):
                 # Skipped updates can shift the 5k-update snapshots off the rollout epochs: every rollout gets a
                 # snapshot of exactly the weights it scores.
                 if accelerator.is_main_process:
@@ -1709,6 +1899,11 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                 self.last_snapshot_step = self.completed_optimizer_steps
             if rollout_due:
                 metrics = self._rollout(run, completed_epoch)
+                if accelerator.is_main_process and training.get("keep_snapshots", "all") == "best":
+                    best = self._keep_best_snapshot(output)
+                    if best is not None:
+                        metrics.update({"rollout/best_success_rate": best["success_rate"],
+                                        "rollout/best_optimizer_step": best["optimizer_step"]})
                 if accelerator.is_main_process:
                     rollout_record = {"event": "rollout", "epoch": completed_epoch,
                                       "optimizer_step": self.completed_optimizer_steps,

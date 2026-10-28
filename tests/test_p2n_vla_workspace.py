@@ -898,6 +898,193 @@ def rollout_config(**overrides):
     return stub_config(**values)
 
 
+class ScoredRolloutRunner(StubRolloutRunner):
+    """StubRolloutRunner whose success rate follows ``rates`` (one entry per rollout; "fail" crashes)."""
+
+    rates = []
+
+    def run(self, policy, **kwargs):
+        result = super().run(policy, **kwargs)
+        rate = ScoredRolloutRunner.rates.pop(0)
+        if rate == "fail":
+            raise RuntimeError("simulated simulator crash")
+        for index, record in enumerate(self.last_episode_records):
+            record["success"] = index < round(rate * self.n_test)
+        return result
+
+
+def test_keep_best_snapshots_keeps_the_best_rollout_and_unscored_ones(tmp_path):
+    # Rollouts after epochs 2, 4 and 5 (the last): 3/6 succeed, the simulator crashes, then a tie at 3/6.
+    ScoredRolloutRunner.rates[:] = [0.5, "fail", 0.5]
+    runner = dict(rollout_config().task.policy.env_runner, _target_="test_p2n_vla_workspace.ScoredRolloutRunner")
+    run_workspace(rollout_config(**{"training.keep_snapshots": "best", "task.policy.env_runner": runner}), tmp_path)
+    rollouts = records(tmp_path / "logs.jsonl", "rollout")
+    steps = [record["optimizer_step"] for record in rollouts]
+    assert [record["rollout/failed"] for record in rollouts] == [0, 1, 0] and len(set(steps)) == 3
+    # The tie keeps the earlier snapshot; the crashed rollout's snapshot stays for an offline evaluation.
+    assert sorted(path.name for path in (tmp_path / "snapshots").glob("upd-*.ckpt")) == \
+        [f"upd-{steps[0]:06d}_ema.ckpt", f"upd-{steps[1]:06d}_ema.ckpt"]
+    best = json.loads((tmp_path / "snapshots/best.json").read_text())
+    assert best["optimizer_step"] == steps[0] and best["success_rate"] == 0.5
+    assert Path(best["snapshot"]).is_file()
+    assert [record.get("rollout/best_success_rate") for record in rollouts] == [0.5, 0.5, 0.5]
+    assert [record.get("rollout/best_optimizer_step") for record in rollouts] == [steps[0]] * 3
+    assert (tmp_path / "checkpoints/latest.ckpt").is_file()  # the latest weights
+
+
+def test_keep_best_snapshots_needs_rollouts_and_no_periodic_snapshots(tmp_path):
+    for overrides, message in (({"training.keep_snapshots": "best", "task.policy.lazy_eval": True}, "keep_snapshots"),
+                               ({"training.keep_snapshots": "best", "training.snapshot_every": 2}, "keep_snapshots"),
+                               ({"training.keep_snapshots": "best", "training.keep_resume_checkpoint": False},
+                                "keep_snapshots"),
+                               ({"training.keep_snapshots": "newest"}, "keep_snapshots")):
+        with pytest.raises(ValueError, match=message):
+            run_workspace(rollout_config(**overrides), tmp_path)
+
+
+def test_keep_best_ranks_each_step_by_its_newest_attempt_and_never_deletes_unranked_snapshots(tmp_path):
+    workspace = Workspace(rollout_config(**{"training.keep_snapshots": "best"}), output_dir=str(tmp_path))
+    snapshots = tmp_path / "snapshots"
+    snapshots.mkdir()
+
+    def rollout(step, rate, replay=0, protocol="official", trials=6, seed=3000, failed=False, finished=True):
+        directory = tmp_path / "eval" / (f"rollout_epoch-0001_upd-{step:06d}" + (f"_r{replay}" if replay else ""))
+        directory.mkdir(parents=True)
+        if finished:
+            (directory / "summary.json").write_text(json.dumps({
+                "tag": directory.name, "epoch": 1, "optimizer_step": step, "success_rate": rate, "trials": trials,
+                "protocol": protocol, "episode_start_seed": seed, "failed": failed}))
+
+    def remaining():
+        return sorted(int(path.name[4:10]) for path in snapshots.glob("upd-*.ckpt"))
+
+    for step in (10, 20, 30, 40, 50, 60, 70):
+        workspace.snapshot_path(step).write_bytes(b"weights")
+    rollout(10, 0.6)
+    rollout(10, 0.2, replay=1)          # replayed after a resume: the newest attempt scores the re-saved weights
+    rollout(20, 0.5)
+    rollout(30, 0.9, trials=4)          # another episode count: never ranked or deleted
+    rollout(40, None, failed=True)
+    rollout(50, None, finished=False)   # interrupted
+    rollout(70, 0.8)
+    rollout(70, None, replay=2, failed=True)  # the replay of 70 failed: its re-saved weights are unscored
+    best = workspace._keep_best_snapshot(tmp_path)
+    assert best["optimizer_step"] == 20 and best["success_rate"] == 0.5
+    assert best["file"] == workspace.snapshot_path(20).name
+    assert remaining() == [20, 30, 40, 50, 60, 70]  # only 10 (newest score 0.2) went; 60 never had a rollout
+    assert json.loads((snapshots / "best.json").read_text())["optimizer_step"] == 20
+    # A ranked step whose file is gone cannot be kept: the best is chosen among existing snapshots.
+    rollout(60, 0.7)
+    workspace.snapshot_path(60).unlink()
+    assert workspace._keep_best_snapshot(tmp_path)["optimizer_step"] == 20
+    # With nothing ranked left, best.json goes instead of naming weights it no longer describes.
+    rollout(20, None, replay=1, failed=True)
+    assert workspace._keep_best_snapshot(tmp_path) is None
+    assert not (snapshots / "best.json").exists() and remaining() == [20, 30, 40, 50, 70]
+
+
+def test_keep_best_resume_refuses_retention_and_evaluation_changes(tmp_path):
+    ScoredRolloutRunner.rates[:] = [0.5, 0.5, 0.5]
+    runner = dict(rollout_config().task.policy.env_runner, _target_="test_p2n_vla_workspace.ScoredRolloutRunner")
+    cfg = rollout_config(**{"training.keep_snapshots": "best", "task.policy.env_runner": runner})
+    run_workspace(cfg, tmp_path)
+    payload = load(tmp_path / "checkpoints/latest.ckpt")
+    Workspace.validate_resume_payload(payload, cfg)
+    for key, value in (("training.keep_snapshots", "all"), ("task.policy.env_runner.n_test", 4),
+                       ("task.policy.env_runner.protocol", "corrected"), ("training.rollout_every", 1)):
+        changed = copy.deepcopy(cfg)
+        OmegaConf.update(changed, key, value, merge=False)
+        with pytest.raises(ValueError, match=key.split(".")[-1]):
+            Workspace.validate_resume_payload(payload, changed)
+
+
+def test_resuming_a_finished_run_reports_an_unfinished_final_rollout(tmp_path, capsys):
+    ScoredRolloutRunner.rates[:] = [0.5, 0.5, 0.5]
+    runner = dict(rollout_config().task.policy.env_runner, _target_="test_p2n_vla_workspace.ScoredRolloutRunner")
+    cfg = rollout_config(**{"training.keep_snapshots": "best", "task.policy.env_runner": runner})
+    run_workspace(cfg, tmp_path)
+    final = sorted((tmp_path / "eval").glob("rollout_*"))[-1]
+    (final / "summary.json").unlink()  # the run was stopped during its final rollout
+    (tmp_path / "training_summary.json").unlink()
+    capsys.readouterr()
+    resumed = copy.deepcopy(cfg)
+    OmegaConf.update(resumed, "training.resume", True, merge=False)
+    OmegaConf.update(resumed, "training.resume_checkpoint", str(tmp_path / "checkpoints/latest.ckpt"), merge=False)
+    assert run_workspace(resumed, tmp_path).completed_optimizer_steps == 0  # nothing to train
+    out = capsys.readouterr().out
+    assert "nothing to do" in out and "never finished" in out and final.name in out
+    summary = json.loads((tmp_path / "training_summary.json").read_text())
+    assert summary["completed_before_this_resume"] and any(item.get("incomplete") for item in summary["rollouts"])
+    # A run that finished normally keeps its full summary when the resume command is run again.
+    (tmp_path / "training_summary.json").write_text(json.dumps({"last_validation": {"val_loss": 1.0}}))
+    run_workspace(resumed, tmp_path)
+    summary = json.loads((tmp_path / "training_summary.json").read_text())
+    assert summary["last_validation"] == {"val_loss": 1.0} and summary["completed_before_this_resume"]
+
+
+def test_resume_warnings_follow_the_newest_attempt_and_catch_a_rollout_that_never_started(tmp_path):
+    workspace = Workspace(rollout_config(**{"training.keep_snapshots": "best", "training.num_epochs": 10}),
+                          output_dir=str(tmp_path))
+
+    def rollout(name, finished=True):
+        directory = tmp_path / "eval" / f"rollout_{name}"
+        directory.mkdir(parents=True)
+        if finished:
+            (directory / "summary.json").write_text(json.dumps({"optimizer_step": 4, "success_rate": 0.5}))
+
+    rollout("epoch-0002_upd-000004", finished=False)  # stopped during it, then replayed and finished
+    rollout("epoch-0002_upd-000004_r1")
+    assert workspace._resume_warnings(tmp_path, epochs=3, steps=6) == []
+    rollout("epoch-0004_upd-000008", finished=False)  # its newest attempt never finished
+    assert ["never finished" in text and "epoch-0004_upd-000008" in text
+            for text in workspace._resume_warnings(tmp_path, epochs=5, steps=10)] == [True]
+    # rollout_every=2: epoch 6 was due; the run stopped between its checkpoint and the rollout.
+    warnings = workspace._resume_warnings(tmp_path, epochs=6, steps=12)
+    assert len(warnings) == 2 and "due after epoch 6 (update 12) never started" in warnings[1]
+    workspace.cfg.task.policy.lazy_eval = True  # no rollouts expected
+    assert len(workspace._resume_warnings(tmp_path, epochs=6, steps=12)) == 1
+
+
+def test_resuming_a_finished_run_whose_final_rollout_never_started_says_so(tmp_path, capsys):
+    ScoredRolloutRunner.rates[:] = [0.5, 0.5, 0.5]
+    runner = dict(rollout_config().task.policy.env_runner, _target_="test_p2n_vla_workspace.ScoredRolloutRunner")
+    cfg = rollout_config(**{"training.keep_snapshots": "best", "task.policy.env_runner": runner})
+    run_workspace(cfg, tmp_path / "run")
+    import shutil
+    shutil.rmtree(sorted((tmp_path / "run/eval").glob("rollout_*"))[-1])  # stopped before the final rollout began
+    resumed = copy.deepcopy(cfg)
+    OmegaConf.update(resumed, "training.resume", True, merge=False)
+    OmegaConf.update(resumed, "training.resume_checkpoint", str(tmp_path / "run/checkpoints/latest.ckpt"),
+                     merge=False)
+    capsys.readouterr()
+    run_workspace(resumed, tmp_path / "run")
+    assert "due after epoch 5" in capsys.readouterr().out
+    # A workspace pointed at a fresh directory with only the checkpoint still writes its summary.
+    elsewhere = tmp_path / "elsewhere" / "run"
+    Workspace(resumed, output_dir=str(elsewhere)).run()
+    assert (elsewhere / "training_summary.json").is_file()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_park_optimizer_state_moves_the_adamw_moments_off_the_gpu_and_back():
+    from oat.workspace.train_p2n_vla import park_optimizer_state, restore_optimizer_state
+    model = nn.Linear(64, 64).cuda()
+    optimizer = torch.optim.AdamW(model.parameters(), fused=True)
+    model(torch.randn(4, 64, device="cuda")).sum().backward()
+    optimizer.step()
+    before = {id(p): {key: value.clone() for key, value in state.items()} for p, state in optimizer.state.items()}
+    # accelerate's device has no index in a single-process run; DDP ranks get cuda:<rank>.
+    for device in (torch.device("cuda"), torch.device("cuda", torch.cuda.current_device())):
+        parked = park_optimizer_state(optimizer, device)
+        assert len(parked) == 4 and all(state[key].device.type == "cpu" for state, key, _ in parked)
+        assert all(state["step"].is_cuda for state in optimizer.state.values())  # the 0-dim step stays
+        restore_optimizer_state(parked)
+        for p, state in optimizer.state.items():
+            for key, value in state.items():
+                assert value.is_cuda and torch.equal(value, before[id(p)][key])
+
+
 def test_rollout_due_after_every_n_completed_epochs_and_at_the_end(tmp_path):
     workspace = Workspace(rollout_config(**{"training.rollout_every": 50, "training.num_epochs": 300}),
                           output_dir=str(tmp_path))
@@ -1265,6 +1452,66 @@ def test_two_rank_resume_is_bitwise_identical_to_an_uninterrupted_run(tmp_path):
     full_losses = [record["train/loss"] for record in records(tmp_path / "full/logs.jsonl", "train_step")][2:]
     resumed_losses = [record["train/loss"] for record in records(tmp_path / "resumed/logs.jsonl", "train_step")]
     assert resumed_losses == full_losses and len(resumed_losses) == 2
+
+
+EARLY_REBUILD_WORKER = '''
+import contextlib, sys
+import torch
+import torch.distributed as dist
+from torch import nn
+from oat.workspace.train_p2n_vla import rebuild_ddp_buckets_early
+
+early, output = sys.argv[1] == "early", sys.argv[2]
+dist.init_process_group("gloo")
+rank = dist.get_rank()
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(6, 32), nn.GELU(), nn.Linear(32, 32), nn.GELU(), nn.Linear(32, 3))
+# Tiny buckets: one or two parameters each, so the rebuild reorders them.
+ddp = nn.parallel.DistributedDataParallel(model, find_unused_parameters=False, gradient_as_bucket_view=True,
+                                          bucket_cap_mb=0.002)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+generator = torch.Generator().manual_seed(100 + rank)
+rebuilt, preserved = [], []
+for update in range(3):
+    for micro in range(2):
+        with ddp.no_sync() if micro == 0 else contextlib.nullcontext():
+            ddp(torch.randn(5, 6, generator=generator)).square().mean().backward()
+    if early:
+        before = [p.grad.clone() for p in model.parameters()]
+        rebuilt.append(rebuild_ddp_buckets_early(ddp, optimizer, torch.device("cpu")))
+        preserved.append(all(torch.equal(b, p.grad) for b, p in zip(before, model.parameters())))
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=False)
+torch.save({"params": [p.detach().clone() for p in model.parameters()], "rebuilt": rebuilt,
+            "preserved": preserved, "has_rebuilt": ddp._has_rebuilt_buckets}, f"{output}/rank{rank}.pt")
+dist.destroy_process_group()
+'''
+
+
+@pytest.mark.slow
+def test_early_ddp_bucket_rebuild_keeps_gradients_and_trajectory_bitwise(tmp_path):
+    """The workspace rebuilds DDP's buckets before the first step (memory); training must not change."""
+    script = tmp_path / "worker.py"
+    script.write_text(EARLY_REBUILD_WORKER)
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="", OMP_NUM_THREADS="1",
+               PYTHONPATH=os.pathsep.join([str(REPO), os.environ.get("PYTHONPATH", "")]))
+    results = {}
+    for mode in ("default", "early"):
+        output = tmp_path / mode
+        output.mkdir()
+        command = [sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc_per_node", "2",
+                   str(script), mode, str(output)]
+        result = subprocess.run(command, cwd=str(REPO), env=env, capture_output=True, text=True, timeout=300)
+        assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-8000:]
+        results[mode] = [torch.load(output / f"rank{rank}.pt") for rank in range(2)]
+    for rank in range(2):
+        default, early = results["default"][rank], results["early"][rank]
+        assert early["rebuilt"] == [True, False, False] and all(early["preserved"])
+        assert default["has_rebuilt"] and early["has_rebuilt"]  # DDP's own forward rebuilt in the default run
+        for reference, value in zip(default["params"], early["params"]):
+            torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    for reference, value in zip(results["early"][0]["params"], results["early"][1]["params"]):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
 
 
 # ------------------------------------------------- integration with the real (tiny) M3 policies

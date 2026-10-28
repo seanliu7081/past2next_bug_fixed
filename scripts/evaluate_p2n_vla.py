@@ -52,6 +52,7 @@ POLICY_TARGETS = {
     "oat.policy.p2n_vla.P2NVLAPolicy": "p2n_vla",
     "oat.policy.p2n_vla_state_gate.P2NVLAStateGatePolicy": "p2n_vla_state_gate",
     "oat.policy.pi05_ki_flow.PI05KIFlowPolicy": "pi05_ki_flow",
+    "oat.policy.pi05_past.Pi05PastPolicy": "pi05_past",
 }
 RUNNERS = {False: "P2NNewLiberoRunner", True: "P2NStateGateNewLiberoRunner"}
 INFERENCE_KEYS = ("temperature", "topk", "use_k_tokens")
@@ -76,6 +77,15 @@ def parser():
                    help="First official initial-state index per task (official protocol only)")
     p.add_argument("--force-gate", choices=("open", "closed"),
                    help="Gate variant only: evaluate with the HIST gate forced open/closed (mask-only change)")
+    p.add_argument("--history-intervention", choices=("zero", "swap", "noise"),
+                   help="Pi05_past diagnostic: the head reads no history (zero), the previous environment's "
+                        "history (swap, needs >= 2 parallel envs) or noisy history (noise); the commands the "
+                        "simulator executes and records are unchanged")
+    p.add_argument("--history-noise-std", type=float,
+                   help="--history-intervention noise: Gaussian std in normalized action units")
+    p.add_argument("--log-commands", action="store_true",
+                   help="Write every episode's executed commands (commands.npz) and closed-loop statistics "
+                        "(command_stats.jsonl; aggregates under closed_loop in summary.json)")
     p.add_argument("--use-k-tokens", type=int, help="Decode only the first k OAT tokens (1..8)")
     p.add_argument("--temperature", type=float, help="Sampling temperature; 0 is greedy (the default policy setting)")
     p.add_argument("--topk", type=int)
@@ -106,6 +116,12 @@ def validate_args(args):
         raise ValueError("--topk must be positive")
     if args.use_k_tokens is not None and not 1 <= args.use_k_tokens <= 8:
         raise ValueError("--use-k-tokens must lie in [1, 8] (8 OAT tokens per chunk)")
+    noise = args.history_noise_std
+    if (args.history_intervention == "noise") != (noise is not None) or (
+            noise is not None and (not math.isfinite(noise) or noise <= 0)):
+        raise ValueError("--history-noise-std (positive) goes with --history-intervention noise, and only there")
+    if args.history_intervention == "swap" and min(args.n_parallel_envs, args.n_test) < 2:
+        raise ValueError("--history-intervention swap needs at least 2 parallel environments")
     if args.seed < 0 or args.seed >= 2 ** 32 or args.episode_start_seed < 0 \
             or args.episode_start_seed + args.n_test >= 2 ** 32:
         raise ValueError("Seeds must fit NumPy's unsigned 32-bit seed range")
@@ -150,6 +166,9 @@ def default_output_dir(args):
         parts.append(f"topk{args.topk}")
     if args.force_gate:
         parts.append(f"gate-{args.force_gate}")
+    if args.history_intervention:
+        noise = f"{args.history_noise_std:g}" if args.history_intervention == "noise" else ""
+        parts.append(f"hist-{args.history_intervention}{noise}")
     return run / "eval" / "_".join(parts)
 
 
@@ -211,6 +230,104 @@ def apply_force_gate(policy, mode):
     if getattr(policy, "history_gate_mode", mode) != mode:
         raise RuntimeError("The gate mode did not change")
     return {"mode": mode, "mechanism": mechanism}
+
+
+def apply_history_intervention(policy, mode, noise_std):
+    """Pi05_past eval diagnostic: only the history the head reads changes; executed commands are unchanged."""
+    if mode is None:
+        return None
+    from oat.common.p2n_new_capabilities import policy_capability
+    if not policy_capability(policy, "supports_history_intervention"):
+        raise ValueError("--history-intervention needs the pi05_past variant")
+    policy.set_history_intervention(mode, noise_std=noise_std or 0.0)
+    return {"mode": mode, "noise_std": noise_std}
+
+
+class CommandLog:
+    """Executed commands per episode for the closed-loop diagnostics.
+
+    The runner resets the policy once per chunk of parallel episodes, in schedule order, and acknowledges
+    each executed prefix through ``record_executed_actions``; both are wrapped on the policy instance.
+    """
+
+    def __init__(self, policy):
+        import numpy as np
+        import torch
+        self.chunks = []  # per runner chunk: per environment, the executed command arrays in order
+        reset, record = policy.reset, policy.record_executed_actions
+
+        def logged_reset():
+            reset()
+            self.chunks.append(None)
+
+        def logged_record(actions, executed_lengths=None):
+            record(actions, executed_lengths=executed_lengths)
+            commands = actions.detach().cpu().numpy() if torch.is_tensor(actions) else np.asarray(actions)
+            lengths = (np.full(commands.shape[0], commands.shape[1]) if executed_lengths is None
+                       else np.asarray(executed_lengths.cpu() if torch.is_tensor(executed_lengths) else executed_lengths))
+            if self.chunks[-1] is None:
+                self.chunks[-1] = [[] for _ in range(commands.shape[0])]
+            for env, count in enumerate(lengths.astype(int)):
+                if count:
+                    self.chunks[-1][env].append(commands[env, :count].astype("float32"))
+
+        policy.reset, policy.record_executed_actions = logged_reset, logged_record
+
+    def episodes(self, n_episodes, n_envs):
+        """Per schedule index: the list of executed chunks ([steps, action_dim] each)."""
+        episodes = []
+        for index in range(n_episodes):
+            chunk, env = divmod(index, n_envs)
+            envs = self.chunks[chunk] if chunk < len(self.chunks) else None
+            episodes.append(list(envs[env]) if envs else [])
+        return episodes
+
+
+def command_statistics(chunks, normalize=None, tail=50, padding_tolerance=0.15):
+    """Closed-loop statistics of one episode's executed chunks (LIBERO: 6 arm dims, then the gripper).
+
+    gripper_toggles: sign changes of the gripper command. boundary_ratio: mean arm-command change across
+    chunk boundaries over the mean change within chunks. final_motion: mean arm-command norm over the last
+    ``tail`` steps (low in stall-ending failures). near_padding_fraction: executed commands within
+    ``padding_tolerance`` (max-abs, normalized units) of the zero padding a missing history slot holds.
+    """
+    import numpy as np
+    if not chunks:
+        return {"steps": 0, "chunks": 0, "gripper_toggles": 0, "boundary_ratio": None, "final_motion": None,
+                "near_padding_fraction": None}
+    commands = np.concatenate(chunks, axis=0)
+    gripper = np.sign(commands[:, -1])
+    gripper = gripper[gripper != 0]
+    toggles = int(np.count_nonzero(gripper[1:] != gripper[:-1]))
+    arm = commands[:, :-1]
+    within = [np.linalg.norm(np.diff(chunk[:, :-1], axis=0), axis=1) for chunk in chunks if len(chunk) > 1]
+    within = np.concatenate(within) if within else np.zeros(0)
+    jumps = np.array([np.linalg.norm(chunks[i + 1][0, :-1] - chunks[i][-1, :-1]) for i in range(len(chunks) - 1)])
+    ratio = float(jumps.mean() / within.mean()) if len(jumps) and len(within) and within.mean() > 0 else None
+    near = None
+    if normalize is not None:
+        distance = np.abs(normalize(commands) - normalize(np.zeros_like(commands[:1]))).max(axis=1)
+        near = float(np.mean(distance < padding_tolerance))
+    return {"steps": int(len(commands)), "chunks": len(chunks), "gripper_toggles": toggles,
+            "boundary_ratio": ratio, "final_motion": float(np.linalg.norm(arm[-tail:], axis=1).mean()),
+            "near_padding_fraction": near}
+
+
+def summarize_commands(stats, records):
+    """Means of the per-episode statistics over successes and failures, plus pooled padding proximity."""
+    import numpy as np
+    summary = {}
+    for label, wanted in (("success", True), ("failure", False)):
+        group = [item for item, record in zip(stats, records) if bool(record["success"]) == wanted]
+        entry = {"episodes": len(group)}
+        for key in ("gripper_toggles", "boundary_ratio", "final_motion"):
+            values = [item[key] for item in group if item[key] is not None]
+            entry[key] = float(np.mean(values)) if values else None
+        summary[label] = entry
+    steps = sum(item["steps"] for item in stats if item["near_padding_fraction"] is not None)
+    near = sum(item["near_padding_fraction"] * item["steps"] for item in stats if item["near_padding_fraction"] is not None)
+    summary["near_padding_fraction"] = near / steps if steps else None
+    return summary
 
 
 def decodes_tokens(policy):
@@ -387,8 +504,11 @@ def main(argv=None):
         inference_kwargs(cls, args)
         if args.force_gate is not None and not getattr(cls, "supports_history_summary_gate", False):
             raise ValueError("--force-gate needs the p2n_vla_state_gate variant")
+        if args.history_intervention is not None and not getattr(cls, "supports_history_intervention", False):
+            raise ValueError("--history-intervention needs the pi05_past variant")
         policy = load_policy(args, payload)
         gate = apply_force_gate(policy, args.force_gate)
+        intervention = apply_history_intervention(policy, args.history_intervention, args.history_noise_std)
         kwargs = inference_kwargs(policy, args)
         runner_template = ((cfg.get("task") or {}).get("policy") or {}).get("env_runner") or {}
         all_tasks, task_names = select_tasks(runner_template, args.tasks)
@@ -428,7 +548,8 @@ def main(argv=None):
                                 if key in ("variant", "variant_code", "model_size", "pi05", "tokenizer",
                                            "sentencepiece", "prompt", "parameters", "artifact_schema")},
             "assets": asset_metadata(policy, args), "module_paths": modules, "package_versions": versions,
-            "effective_inference": inference, "runner_target": runner_config["_target_"],
+            "effective_inference": inference, "history_intervention": intervention,
+            "runner_target": runner_config["_target_"],
             "embedded_runner_target": embedded_runner_target, "renderer": renderer,
             "official_initial_state_files": official_initial_state_files(selected) if args.protocol == "official" else {},
             "task_episode_counts": dict(counts), "all_tasks_covered": set(counts) == set(all_tasks),
@@ -444,6 +565,7 @@ def main(argv=None):
                               "effective_inference": inference}, sort_keys=True))
             return 0
         runner = hydra.utils.instantiate(runner_config)
+        command_log = CommandLog(policy) if args.log_commands else None
         # Simulator construction must not shift the policy RNG between paired evaluations.
         seed_everything(args.seed)
         rollout_started = time.monotonic()
@@ -459,10 +581,34 @@ def main(argv=None):
             "episode_start_seed": args.episode_start_seed, "checkpoint": str(args.snapshot),
             "checkpoint_sha256": metadata["checkpoint_sha256"], "weights": args.weights,
             "optimizer_step": metadata["optimizer_step"], "force_gate": args.force_gate,
+            "history_intervention": intervention,
             "rollout_seconds": rollout_seconds, "episodes_per_second": len(records) / rollout_seconds,
             "max_episode_steps": runner_config["max_episode_steps"], "effective_inference": inference,
             "balanced_schedule": metadata["balanced_schedule"], "all_tasks_covered": metadata["all_tasks_covered"],
         })
+        if command_log is not None:
+            import numpy as np
+            normalizer = policy.action_normalizer["action"]
+
+            def normalize(values):
+                with torch.no_grad():
+                    tensor = torch.as_tensor(values, dtype=torch.float32, device=policy.device)
+                    return normalizer.normalize(tensor).float().cpu().numpy()
+
+            episodes = command_log.episodes(len(records), len(runner.env_fns))
+            stats = [dict(command_statistics(chunks, normalize), episode=index, task_name=record["task_name"],
+                          success=bool(record["success"]), termination=record["termination"])
+                     for index, (chunks, record) in enumerate(zip(episodes, records))]
+            arrays = {}
+            for index, chunks in enumerate(episodes):
+                arrays[f"episode_{index:05d}"] = (np.concatenate(chunks) if chunks
+                                                  else np.zeros((0, policy.action_dim), np.float32))
+                arrays[f"episode_{index:05d}_chunk_lengths"] = np.array([len(chunk) for chunk in chunks])
+            np.savez_compressed(args.output_dir / "commands.npz", **arrays)
+            with open(args.output_dir / "command_stats.jsonl", "w") as handle:
+                for item in stats:
+                    handle.write(json.dumps(item, sort_keys=True) + "\n")
+            summary["closed_loop"] = summarize_commands(stats, records)
         atomic_json(args.output_dir / "summary.json", summary)
         metadata.update({"status": "complete", "total_seconds": time.monotonic() - started})
         atomic_json(args.output_dir / "metadata.json", metadata)

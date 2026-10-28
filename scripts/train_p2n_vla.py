@@ -43,6 +43,9 @@ VARIANTS = {
                            "gate": True, "flow": False},
     "pi05_ki_flow": {"config": "train_pi05_ki_flow", "target": "oat.policy.pi05_ki_flow.PI05KIFlowPolicy",
                      "gate": False, "flow": True},
+    # pi05 flow head + the Past2Next condition (docs/PI05_PAST.md); use_past=false gives its no-past control.
+    "pi05_past": {"config": "train_pi05_past", "target": "oat.policy.pi05_past.Pi05PastPolicy",
+                  "gate": False, "flow": True, "past": True},
 }
 TASKS = ("libero",)
 DATASET_TARGETS = {False: "oat.dataset.vla_dataset.VLAZarrDatasetWithPrevWindow",
@@ -80,6 +83,12 @@ def _int(value, name, minimum=1, allow_none=False):
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}" + (" or null" if allow_none else ""))
     return value
+
+
+def _number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    return float(value)
 
 
 def validate_config(cfg, variant, task):
@@ -149,6 +158,14 @@ def validate_config(cfg, variant, task):
         raise ValueError("task.policy.lazy_eval must be true (no rollouts) or false (in-training rollouts)")
     if not lazy_eval:
         validate_rollout(cfg)
+    keep = training.get("keep_snapshots", "all")
+    if keep not in ("all", "best"):
+        raise ValueError("training.keep_snapshots must be all or best")
+    if keep == "best" and (lazy_eval or int(training.get("snapshot_every", 0) or 0)
+                           or not training.get("keep_resume_checkpoint", False)):
+        raise ValueError("training.keep_snapshots=best ranks the rollout snapshots and keeps the latest weights "
+                         "in checkpoints/latest.ckpt: it needs task.policy.lazy_eval=false, "
+                         "training.snapshot_every=0 and training.keep_resume_checkpoint=true")
     history = sorted(key for key in policy if str(key).startswith(("history_", "state_history")))
     if not gate and history:
         raise ValueError(f"{variant} must not construct history/gate modules: {history}")
@@ -163,7 +180,41 @@ def validate_config(cfg, variant, task):
                 raise ValueError(f"policy and {name} state-history keys/steps must agree")
         if policy.get("use_past") is not True:
             raise ValueError("The gate variant needs past conditioning (use_past=true)")
-    if flow:
+    if flow and spec.get("past", False):
+        if not isinstance(policy.get("use_past"), bool):
+            raise ValueError(f"{variant} needs policy.use_past true (Pi05_past) or false (its no-past control)")
+        if not policy.use_past and training.get("validate_generated_history"):
+            raise ValueError(f"{variant} with use_past=false has no generated history: "
+                             "set training.validate_generated_history=false")
+        scale = float(policy.get("kv_grad_scale", 1.0))
+        if not math.isfinite(scale) or not 0.0 <= scale <= 1.0:
+            raise ValueError("policy.kv_grad_scale must lie in [0, 1]")
+        if (scale == 0 and float(policy.get("lambda_ki", 0.0)) == 0
+                and (policy.get("train_vision", True) or policy.get("train_lora", True))):
+            raise ValueError("kv_grad_scale=0 with lambda_ki=0 leaves the trainable SigLIP/LoRA without a loss")
+        # The constructor's checks, here so --dry-run fails before the workers load 14.5 GB of weights.
+        _int(policy.get("flow_num_steps"), "policy.flow_num_steps")
+        beta = list(policy.get("flow_time_beta") or [])
+        if len(beta) != 2 or not all(_number(x, "policy.flow_time_beta") > 0 for x in beta):
+            raise ValueError("policy.flow_time_beta must be two positive numbers")
+        if not 0.0 <= _number(policy.get("cond_t0"), "policy.cond_t0") <= 1.0:
+            raise ValueError("policy.cond_t0 must lie in [0, 1]")
+        if not 0.0 <= _number(policy.get("cond_dropout"), "policy.cond_dropout") < 1.0:
+            raise ValueError("policy.cond_dropout must lie in [0, 1)")
+        if policy.get("ki_init") not in ("embedding", "random"):
+            raise ValueError("policy.ki_init must be embedding or random")
+        for key in ("train_vision", "train_lora", "vision_activation_checkpointing"):
+            if not isinstance(policy.get(key), bool):
+                raise ValueError(f"policy.{key} must be a boolean")
+        if not _number(policy.get("lora_alpha"), "policy.lora_alpha") > 0:
+            raise ValueError("policy.lora_alpha must be positive")
+        _int(policy.get("self_past_warmup_steps"), "policy.self_past_warmup_steps", minimum=0)
+        _int(policy.get("self_past_ramp_steps"), "policy.self_past_ramp_steps", minimum=0)
+        for key in ("policy_lr", "new_module_lr", "weight_decay"):
+            if not _number(cfg.optimizer.get(key), f"optimizer.{key}") >= 0:
+                raise ValueError(f"optimizer.{key} must be nonnegative")
+        _int(cfg.get("seed"), "seed", minimum=0)
+    elif flow:
         if policy.get("use_past") is not False:
             raise ValueError("pi05_ki_flow takes no past input: set policy.use_past=false")
         if training.get("validate_generated_history"):
@@ -540,7 +591,8 @@ def model_report(cfg):
                      "trainable_keys": len(trainable_names & set(artifact))},
         "estimated_bytes": {
             "snapshot": artifact_bytes - trainable_bytes // 2,       # trainable tensors stored in bf16
-            "resume_checkpoint": 2 * artifact_bytes + 2 * trainable_bytes,  # live + EMA + Adam moments
+            # live (+ EMA) + Adam moments
+            "resume_checkpoint": (2 if cfg.training.get("use_ema", True) else 1) * artifact_bytes + 2 * trainable_bytes,
         },
         "dtype": str(dtype),
         "metadata": {key: value for key, value in policy.artifact_metadata().items()

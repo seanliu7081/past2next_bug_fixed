@@ -1,0 +1,79 @@
+# Pi05_past on LIBERO-10: pi05_base's ORIGINAL flow-matching action head (unfolded adaRMS, 10 Euler steps)
+# plus the Past2Next condition of train_past2next_self_past.yaml: 7 past commands, acc/jerk dynamic features
+# and self-past. The condition is a static memory: its expert K/V are computed once per sample and appended
+# to the VLM K/V the flow head reads. Default VLM regime = pi05 fine-tune style: the flow loss trains SigLIP and
+# Gemma LoRA r32 through un-detached K/V; no KI loss. Design and commands: docs/PI05_PAST.md.
+# Launch: bash train_pi05_past.sh --help (flags override keys here or in train_p2n_vla.yaml; Hydra overrides after --).
+defaults:
+  - train_p2n_vla
+  - _self_
+
+name: train_pi05_past
+variant: pi05_past
+
+policy:
+  _target_: oat.policy.pi05_past.Pi05PastPolicy
+  # Repo-local assets (the base config's spm_path / tokenizer_checkpoint point at paths that no longer exist).
+  # train_pi05_past.sh passes both from its own checkout, so the repo can move.
+  spm_path: /workspace/ysk/past2next_bug_fixed/data/pretrained/p2n_vla/paligemma_tokenizer.model
+  tokenizer_checkpoint: /workspace/ysk/past2next_bug_fixed/data/pretrained/p2n_vla/oat_from_upd030000.ckpt
+
+  # ---- action head: pi05_base flow expert, unchanged
+  flow_num_steps: 10               # Euler steps at inference and in self-past generation
+  flow_time_beta: [1.5, 1.0]       # flow time t ~ Beta(1.5, 1) * 0.999 + 0.001 (PI0.5)
+
+  # ---- Past2Next condition (train_past2next_self_past.yaml)
+  use_past: true                   # false = the pi05 no-past control (no condition tokens, no self-past)
+  self_past_p: 0.5                 # per-sample probability of the self-generated history
+  self_past_warmup_steps: 1000     # optimizer updates of ground-truth history before self-past starts
+  self_past_ramp_steps: 0          # 0 = p jumps to self_past_p after the warmup (the original schedule)
+  self_past_chunk_size: 4          # previous-window rows generated per inner call
+  self_past_temperature: 1.0       # ignored: self-past uses the deployment flow sampler
+  self_past_topk: 10               # ignored
+  cond_t0: 0.6                     # constant flow time for the condition tokens' expert pass
+  cond_dropout: 0.1                # dropout on the condition embeddings in training (the original p_drop_emb)
+
+  # ---- VLM regime
+  kv_grad_scale: 1.0               # 1 = flow loss reaches the VLM (pi05 fine-tune); 0 = detached (insulated)
+  lambda_ki: 0.0                   # >0 adds the OAT-token KI loss on the VLM side
+  ki_init: embedding               # KI table init when lambda_ki>0: embedding (pi05 rows) or random
+  train_vision: true               # SigLIP + projector trainable (fp32 masters)
+  vision_activation_checkpointing: true
+  train_lora: true                 # Gemma-2B LoRA trainable
+  lora_rank: 32
+  lora_alpha: 32.0
+
+training:
+  validate_generated_history: true # set false with use_past=false
+  # 32 samples per update (micro-batch 4 x GPUs x accumulation; train_pi05_past.sh sets the accumulation from
+  # the GPU count); 100 updates per "epoch".
+  gradient_accumulate_every: 4
+  max_train_steps: ${eval:'100 * ${training.gradient_accumulate_every}'}
+  num_epochs: 800
+  max_optimizer_steps: 80000       # hard stop and cosine horizon (LR anneals to min_lr_ratio x peak)
+  lr_warmup_steps: 1000
+  use_ema: false                   # an fp32 GPU EMA does not fit at this scope; endpoint = live weights at the stop
+  val_every: 50                    # epochs (offline validation; within-run monitoring only)
+  max_val_steps: 200
+  max_reconst_steps: 200
+  checkpoint_every: 10             # epochs (checkpoints/latest.ckpt: the latest weights, resumable)
+  snapshot_every: 0                # no periodic snapshots: each rollout saves one ...
+  keep_snapshots: best             # ... and only the best rollout's survives (snapshots/best.json)
+  rollout_every: 100               # epochs = 10k updates: official LIBERO-10 protocol, 500 episodes, rank 0
+  keep_resume_checkpoint: true
+  allow_dataset_change: false
+
+dataloader:
+  batch_size: 4                    # micro-batch per GPU
+
+val_dataloader:
+  batch_size: 4
+
+task:
+  policy:
+    lazy_eval: false               # in-training simulator evaluation (training.rollout_every, env_runner of the base)
+
+logging:
+  name: ${now:%Y%m%d.%H%M%S}_${variant}_${task_name}_seed${seed}
+  tags: ['${variant}', '${task_name}', 'pi05_base', 'flow_head', 'p2n_condition']
+  group: ${variant}_${task_type}

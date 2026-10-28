@@ -264,7 +264,7 @@ class GemmaJoint(nn.Module):
         return norm(x, seg_ids) if self.norm_mode == "segment" else norm(x, cond)
 
     def _expert_layer(self, layer: ExpertLayer, x: Tensor, prefix_kv: KeyValue, cached: Optional[KeyValue],
-                      bias: Tensor, cos: Tensor, sin: Tensor, seg_ids, cond, probe_cols):
+                      bias: Tensor, cos: Tensor, sin: Tensor, seg_ids, cond, probe_cols, probe_rows="last"):
         spec = self.expert_spec
         batch, length, _ = x.shape
         h, attn_gate = self._norm(layer.input_layernorm, x, seg_ids, cond)
@@ -288,7 +288,10 @@ class GemmaJoint(nn.Module):
             mass = None
             if probe_cols is not None:
                 start, stop = probe_cols
-                mass = probs[:, :, -1, start:stop].sum(dim=-1).mean().detach()
+                if probe_rows == "all":
+                    mass = probs[:, :, :, start:stop].sum(dim=-1).mean().detach()
+                else:
+                    mass = probs[:, :, -1, start:stop].sum(dim=-1).mean().detach()
         out = out.to(h.dtype).transpose(1, 2).reshape(batch, length, spec.num_heads * spec.head_dim)
         x = x + layer.self_attn.o_proj(out) * attn_gate
         h, mlp_gate = self._norm(layer.post_attention_layernorm, x, seg_ids, cond)
@@ -298,8 +301,12 @@ class GemmaJoint(nn.Module):
     def expert_forward(self, x: Tensor, prefix_kv: Sequence[KeyValue], layout_bias: Tensor, positions: Tensor, *,
                        seg_ids: Optional[Tensor] = None, cond: Optional[Tensor] = None,
                        cache: Optional[ExpertCache] = None, use_cache: bool = False,
-                       probe_cols: Optional[Tuple[int, int]] = None) -> ExpertOutput:
+                       probe_cols: Optional[Tuple[int, int]] = None, probe_rows: str = "last") -> ExpertOutput:
+        """``probe_cols`` returns each layer's attention mass on those key columns, from the last query row
+        (``probe_rows="last"``) or averaged over every query row (``"all"``)."""
         spec = self.expert_spec
+        if probe_rows not in ("last", "all"):
+            raise ValueError("probe_rows must be last or all")
         batch, length, width = x.shape
         if width != spec.width:
             raise ValueError(f"Expert inputs must have width {spec.width}")
@@ -323,7 +330,7 @@ class GemmaJoint(nn.Module):
         for index, layer in enumerate(self.expert.layers):
             cached = cache.kv[index] if cache is not None else None
             x, k, v, mass = self._expert_layer(layer, x, prefix_kv[index], cached, layout_bias, cos, sin,
-                                               seg_ids, cond, probe_cols)
+                                               seg_ids, cond, probe_cols, probe_rows)
             if use_cache:
                 if cached is not None:
                     k, v = torch.cat((cached[0], k), dim=2), torch.cat((cached[1], v), dim=2)
