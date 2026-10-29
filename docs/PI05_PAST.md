@@ -3,7 +3,8 @@
 Pi05_past keeps pi05_base's original flow-matching action head and adds the Past2Next condition of
 `oat/config/train_past2next_self_past.yaml`: the 7 past commands, their acceleration and jerk, and self-past
 training. Variant `pi05_past`, class `oat.policy.pi05_past.Pi05PastPolicy`, config
-`oat/config/train_pi05_past.yaml`, launcher `train_pi05_past.sh`.
+`oat/config/train_pi05_past.yaml`, launcher `train_pi05_past.sh`. Its sibling with the Past2Next AR token head
+instead of the flow head is pi05_p2n ([PI05_P2N.md](PI05_P2N.md)).
 
 ## Design
 

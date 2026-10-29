@@ -53,6 +53,7 @@ POLICY_TARGETS = {
     "oat.policy.p2n_vla_state_gate.P2NVLAStateGatePolicy": "p2n_vla_state_gate",
     "oat.policy.pi05_ki_flow.PI05KIFlowPolicy": "pi05_ki_flow",
     "oat.policy.pi05_past.Pi05PastPolicy": "pi05_past",
+    "oat.policy.pi05_p2n.Pi05P2NPolicy": "pi05_p2n",
 }
 RUNNERS = {False: "P2NNewLiberoRunner", True: "P2NStateGateNewLiberoRunner"}
 INFERENCE_KEYS = ("temperature", "topk", "use_k_tokens")
@@ -78,7 +79,7 @@ def parser():
     p.add_argument("--force-gate", choices=("open", "closed"),
                    help="Gate variant only: evaluate with the HIST gate forced open/closed (mask-only change)")
     p.add_argument("--history-intervention", choices=("zero", "swap", "noise"),
-                   help="Pi05_past diagnostic: the head reads no history (zero), the previous environment's "
+                   help="Pi05_past / pi05_p2n diagnostic: the head reads no history (zero), the previous environment's "
                         "history (swap, needs >= 2 parallel envs) or noisy history (noise); the commands the "
                         "simulator executes and records are unchanged")
     p.add_argument("--history-noise-std", type=float,
@@ -238,7 +239,7 @@ def apply_history_intervention(policy, mode, noise_std):
         return None
     from oat.common.p2n_new_capabilities import policy_capability
     if not policy_capability(policy, "supports_history_intervention"):
-        raise ValueError("--history-intervention needs the pi05_past variant")
+        raise ValueError("--history-intervention needs a Pi05_past-condition variant (pi05_past, pi05_p2n)")
     policy.set_history_intervention(mode, noise_std=noise_std or 0.0)
     return {"mode": mode, "noise_std": noise_std}
 
@@ -505,7 +506,7 @@ def main(argv=None):
         if args.force_gate is not None and not getattr(cls, "supports_history_summary_gate", False):
             raise ValueError("--force-gate needs the p2n_vla_state_gate variant")
         if args.history_intervention is not None and not getattr(cls, "supports_history_intervention", False):
-            raise ValueError("--history-intervention needs the pi05_past variant")
+            raise ValueError("--history-intervention needs a Pi05_past-condition variant (pi05_past, pi05_p2n)")
         policy = load_policy(args, payload)
         gate = apply_force_gate(policy, args.force_gate)
         intervention = apply_history_intervention(policy, args.history_intervention, args.history_noise_std)

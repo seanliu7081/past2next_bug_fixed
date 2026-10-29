@@ -14,6 +14,9 @@
 #   bash train_pi05_past.sh --devices 2,3 --self-past-p 0         # Pi05_past with ground-truth history only
 #   bash train_pi05_past.sh --devices 0,1 --resume output/training/<run>/checkpoints/latest.ckpt
 #   bash train_pi05_past.sh --devices 0,1 -- training.val_every=25 # any other Hydra override
+#
+# --variant pi05_p2n (or train_pi05_p2n.sh) swaps the flow head for the Past2Next self-past AR head over
+# 8 OAT tokens and keeps everything else; see docs/PI05_P2N.md and oat/config/train_pi05_p2n.yaml.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,9 +29,11 @@ Usage: bash train_pi05_past.sh [flags] [-- hydra.overrides ...]
 Flags take a value as `--flag VALUE` or `--flag=VALUE`.
 
 Run control
+  --variant NAME          pi05_past (default: the pi05 flow head) or pi05_p2n (the Past2Next self-past AR head
+                          over 8 OAT tokens; train_pi05_p2n.sh passes it). Everything else is shared
   --devices LIST          GPUs, e.g. 0,1; one process per GPU. Required to train or probe
   --output DIR            run directory; fresh runs need it empty
-                          (default output/training/pi05_past[_nopast|_gtpast]_libero10_seed<SEED>)
+                          (default output/training/<variant>[_nopast|_gtpast]_libero10_seed<SEED>)
   --resume CKPT           continue from <run>/checkpoints/latest.ckpt with the same GPU count and the
                           original flags; the W&B run continues too (see --wandb-id)
   --seed N                training seed (default 42)
@@ -50,8 +55,15 @@ Pi05_past condition (Past2Next)
   --self-past-warmup N    optimizer updates before self-past starts (default 1000)
   --self-past-ramp N      linear probability ramp after the warmup (default 0)
   --cond-dropout P        dropout on the condition embeddings in training (default 0.1)
-  --cond-t0 T             constant flow time of the condition tokens' expert pass (default 0.6)
-  --flow-steps N          Euler steps at inference and in self-past (default 10)
+  --cond-t0 T             constant flow time of the condition tokens' expert pass (default 0.6; pi05_p2n also
+                          folds its adaRMS at this time)
+  --flow-steps N          pi05_past only: Euler steps at inference and in self-past (default 10)
+
+pi05_p2n head (pi05_p2n only)
+  --temperature T         deployment sampler: in-training evaluation and the evaluator default (default 0 = greedy)
+  --topk K                deployment top-k when temperature > 0 (default 10)
+  --self-past-temperature T  self-past sampler (default 1.0, the Past2Next self-past sampler)
+  --self-past-topk K      self-past top-k (default 10)
 
 VLM regime
   --kv-grad-scale S       1 = the flow loss reaches the VLM (default); 0 = detached/insulated
@@ -83,8 +95,10 @@ Evaluation and checkpoints
   --sim-eval-every N      LIBERO simulator evaluation on GPU 0 every N optimizer updates, a multiple of 100
                           (default 10000; 0 = none, evaluate offline with scripts/evaluate_p2n_vla.py)
   --sim-eval-episodes N   episodes per evaluation (default 500 = the official protocol, 50 per task)
-  --keep-snapshots MODE   best = keep only the best evaluation's snapshot (snapshots/best.json; default);
-                          all = keep every --snapshot-every snapshot. checkpoints/latest.ckpt is always kept
+  --keep-snapshots MODE   best = keep only the best evaluation's snapshot (snapshots/best.json; pi05_past default);
+                          all = keep every --snapshot-every snapshot (default 5000 with this flag).
+                          checkpoints/latest.ckpt is always kept. pi05_p2n's default keeps every evaluation's
+                          snapshot and no periodic ones
   --checkpoint-every N    epochs between checkpoints/latest.ckpt (default 10)
   --val-every N           epochs between offline validations (default 50)
   --val-steps N           validation batches per GPU (default 200)
@@ -112,9 +126,10 @@ VALUE_FLAGS=" --devices --output --resume --seed --probe-steps --python --pi05 -
  --cond-t0 --flow-steps --kv-grad-scale --lambda-ki --ki-init --train-vision --train-lora --lora-rank --lora-alpha
  --batch --batch-size --grad-accum --max-steps --warmup --lr --new-lr --min-lr-ratio --weight-decay --grad-clip --use-ema
  --ema-decay --snapshot-every --checkpoint-every --val-every --val-steps --num-workers --sim-eval-every
- --sim-eval-episodes --keep-snapshots "
+ --sim-eval-episodes --keep-snapshots --variant --temperature --topk --self-past-temperature --self-past-topk "
 VALUE_FLAGS=${VALUE_FLAGS//$'\n'/ }
 
+VARIANT=""; FLOW_FLAG=""; AR_FLAGS=()
 DEVICES=""; OUTPUT=""; RESUME=""; SEED=""; MODE="train"; PROBE_STEPS=""
 ALLOW_BUSY=false; PI05=""; SPM=""; TOKENIZER=""; WANDB_MODE=""; WANDB_ID=""
 USE_PAST=true; SELF_PAST_P=""; MAX_STEPS=""; MICRO=4; ACCUM=""; GLOBAL_BATCH=""
@@ -160,7 +175,13 @@ while (($#)); do
     --self-past-ramp) need_uint "$flag" "$value"; OVERRIDES+=("policy.self_past_ramp_steps=$value") ;;
     --cond-dropout) need_number "$flag" "$value"; OVERRIDES+=("policy.cond_dropout=$value") ;;
     --cond-t0) need_number "$flag" "$value"; OVERRIDES+=("policy.cond_t0=$value") ;;
-    --flow-steps) need_posint "$flag" "$value"; OVERRIDES+=("policy.flow_num_steps=$value") ;;
+    --flow-steps) need_posint "$flag" "$value"; FLOW_FLAG="$flag"; OVERRIDES+=("policy.flow_num_steps=$value") ;;
+    --variant) [[ -z "$VARIANT" ]] || die "--variant given twice"
+               case "$value" in pi05_past|pi05_p2n) VARIANT="$value" ;; *) die "--variant must be pi05_past or pi05_p2n" ;; esac ;;
+    --temperature) need_number "$flag" "$value"; AR_FLAGS+=("$flag"); OVERRIDES+=("policy.temperature=$value") ;;
+    --topk) need_posint "$flag" "$value"; AR_FLAGS+=("$flag"); OVERRIDES+=("policy.topk=$value") ;;
+    --self-past-temperature) need_number "$flag" "$value"; AR_FLAGS+=("$flag"); OVERRIDES+=("policy.self_past_temperature=$value") ;;
+    --self-past-topk) need_posint "$flag" "$value"; AR_FLAGS+=("$flag"); OVERRIDES+=("policy.self_past_topk=$value") ;;
     --kv-grad-scale) need_number "$flag" "$value"; OVERRIDES+=("policy.kv_grad_scale=$value") ;;
     --lambda-ki) need_number "$flag" "$value"; OVERRIDES+=("policy.lambda_ki=$value") ;;
     --ki-init) case "$value" in embedding|random) OVERRIDES+=("policy.ki_init=$value") ;; *) die "--ki-init must be embedding or random" ;; esac ;;
@@ -207,6 +228,14 @@ for item in ${EXTRA[@]+"${EXTRA[@]}"}; do
   esac
 done
 
+VARIANT="${VARIANT:-pi05_past}"
+if [[ "$VARIANT" == pi05_past ]]; then
+  LABEL=Pi05_past
+  ((${#AR_FLAGS[@]} == 0)) || die "${AR_FLAGS[0]} applies to the pi05_p2n token head only (the flow head has no token sampler)"
+else
+  LABEL=Pi05_p2n
+  [[ -z "$FLOW_FLAG" ]] || die "$FLOW_FLAG applies to the pi05_past flow head only"
+fi
 [[ -n "$PYTHON_BIN" && -x "$PYTHON_BIN" ]] || die "Python interpreter not executable: ${PYTHON_BIN:-?} (set P2N_PYTHON or pass --python)"
 [[ -z "$PROBE_STEPS" || "$MODE" == probe ]] || die "--probe-steps needs --probe"
 if [[ -n "$DEVICES" ]]; then
@@ -270,7 +299,7 @@ if [[ -n "$RESUME" && -z "$WANDB_ID" && "$MODE" != probe && "$WANDB_MODE" != dis
 fi
 [[ -n "$WANDB_ID" ]] && OVERRIDES+=("logging.id=$WANDB_ID" "logging.resume=allow")
 
-LAUNCH=(--variant pi05_past --task libero)
+LAUNCH=(--variant "$VARIANT" --task libero)
 [[ -n "$DEVICES" ]] && LAUNCH+=(--devices "$DEVICES")
 LAUNCH+=(--spm "${SPM:-$ROOT/data/pretrained/p2n_vla/paligemma_tokenizer.model}")
 LAUNCH+=(--tokenizer "${TOKENIZER:-$ROOT/data/pretrained/p2n_vla/oat_from_upd030000.ckpt}")
@@ -289,11 +318,11 @@ if [[ -z "$OUTPUT" && -z "$RESUME" && "$MODE" != "probe" ]]; then
   elif [[ -n "$SELF_PAST_P" ]] && awk -v p="$SELF_PAST_P" 'BEGIN { exit !(p + 0 == 0) }'; then
     SUFFIX="_gtpast"
   fi
-  OUTPUT="$ROOT/output/training/pi05_past${SUFFIX}_libero10_seed${SEED:-42}"
+  OUTPUT="$ROOT/output/training/${VARIANT}${SUFFIX}_libero10_seed${SEED:-42}"
 fi
 [[ -n "$OUTPUT" ]] && LAUNCH+=(--output "$OUTPUT")
 
-echo "Pi05_past: mode=$MODE devices=${DEVICES:-none} use_past=$USE_PAST" \
+echo "$LABEL: mode=$MODE devices=${DEVICES:-none} use_past=$USE_PAST" \
      "batch=$MICRO x $WORLD GPUs x $ACCUM = $((MICRO * WORLD * ACCUM))${OUTPUT:+ output=$OUTPUT}"
 export HF_HOME="${HF_HOME:-/workspace/.hf_home}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"

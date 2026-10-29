@@ -13,6 +13,8 @@ from oat.policy.p2n_vla_state_gate import P2NVLAStateGatePolicy
 from oat.policy.pi05_ki_flow import PI05KIFlowPolicy
 
 TOKENIZER = Path("/workspace/hf_upload/tokenizer_oattok_so3aug_ep4960_mse0.001.ckpt")
+if not TOKENIZER.is_file():  # the upload is gone here: use the same OAT recovered from the P2N-VLA snapshot
+    TOKENIZER = Path(__file__).resolve().parents[1] / "data/pretrained/p2n_vla/oat_from_upd030000.ckpt"
 pytestmark = pytest.mark.skipif(not TOKENIZER.is_file(), reason=f"OAT tokenizer missing at {TOKENIZER}")
 
 SHAPE_META = {

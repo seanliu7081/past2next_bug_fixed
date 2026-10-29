@@ -93,7 +93,7 @@ register_new_resolvers()
 
 CHECKPOINT_FORMAT = "p2n_vla_checkpoint_v1"
 POLICY_FAMILY = "p2n_vla"
-VARIANTS = ("p2n_vla", "p2n_vla_state_gate", "pi05_ki_flow", "pi05_past")
+VARIANTS = ("p2n_vla", "p2n_vla_state_gate", "pi05_ki_flow", "pi05_past", "pi05_p2n")
 CLIP_GROUP_NAMES = ("ar", "ki")
 OPTIMIZER_GROUP_NAMES = ("pretrained", "new")
 OPTIMIZER_KEYS = ("policy_lr", "new_module_lr", "weight_decay", "betas", "eps", "fused")
@@ -105,7 +105,7 @@ RESUME_TOP_LEVEL_KEYS = ("variant", "task_type", "horizon", "n_action_steps", "n
 SOURCE_FILES = ("oat/workspace/train_p2n_vla.py", "oat/model/common/trainable_ema.py",
                 "scripts/train_p2n_vla.py", "oat/config/train_p2n_vla.yaml",
                 "oat/config/train_p2n_vla_state_gate.yaml", "oat/config/train_pi05_ki_flow.yaml",
-                "oat/config/train_pi05_past.yaml")
+                "oat/config/train_pi05_past.yaml", "oat/config/train_pi05_p2n.yaml")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 GIB = float(2 ** 30)
 

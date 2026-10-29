@@ -1,0 +1,31 @@
+# pi05_p2n on LIBERO-10: Pi05_past (train_pi05_past.yaml) with its flow-matching action head replaced by the
+# Past2Next self-past head. The pi05_base Gemma-300M expert decodes the 8 frozen-OAT tokens autoregressively
+# (cross-entropy, a new tied 5001x1024 token embedding, KV-cached decoding). Everything else is inherited from
+# train_pi05_past.yaml unchanged: VLM regime, Past2Next condition, self-past schedule, data, batch, schedule,
+# evaluation. Design and commands: docs/PI05_P2N.md.
+# Launch: bash train_pi05_p2n.sh --help (flags override keys here; Hydra overrides after --).
+defaults:
+  - train_pi05_past
+  - _self_
+
+name: train_pi05_p2n
+variant: pi05_p2n
+
+policy:
+  _target_: oat.policy.pi05_p2n.Pi05P2NPolicy
+
+  # ---- action head: Past2Next autoregressive OAT tokens (no flow head)
+  flow_num_steps: null             # no flow head (non-null values are refused)
+  flow_time_beta: null
+  adarms_t0: ${policy.cond_t0}     # the pi05 adaRMS is folded at this constant time; must equal cond_t0
+  temperature: 0.0                 # deployment sampler (in-training evaluation, evaluator default): greedy
+  topk: 10                         # top-k when temperature > 0
+  self_past_temperature: 1.0       # self-past sampler: T=1 / top-k 10, the Past2Next self-past sampler
+  self_past_topk: 10               # (null = the deployment sampler)
+
+training:
+  keep_snapshots: all              # keep every evaluation's snapshot (8 x ~1.6 GB); snapshot_every stays 0, so
+                                   # each 10k evaluation saves exactly the weights it scores and nothing else
+
+logging:
+  tags: ['${variant}', '${task_name}', 'pi05_base', 'past2next_ar_head', 'p2n_condition']

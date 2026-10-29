@@ -46,6 +46,9 @@ VARIANTS = {
     # pi05 flow head + the Past2Next condition (docs/PI05_PAST.md); use_past=false gives its no-past control.
     "pi05_past": {"config": "train_pi05_past", "target": "oat.policy.pi05_past.Pi05PastPolicy",
                   "gate": False, "flow": True, "past": True},
+    # Pi05_past with the Past2Next self-past AR head over 8 OAT tokens instead of flow (docs/PI05_P2N.md).
+    "pi05_p2n": {"config": "train_pi05_p2n", "target": "oat.policy.pi05_p2n.Pi05P2NPolicy",
+                 "gate": False, "flow": False, "past": True},
 }
 TASKS = ("libero",)
 DATASET_TARGETS = {False: "oat.dataset.vla_dataset.VLAZarrDatasetWithPrevWindow",
@@ -180,7 +183,7 @@ def validate_config(cfg, variant, task):
                 raise ValueError(f"policy and {name} state-history keys/steps must agree")
         if policy.get("use_past") is not True:
             raise ValueError("The gate variant needs past conditioning (use_past=true)")
-    if flow and spec.get("past", False):
+    if spec.get("past", False):
         if not isinstance(policy.get("use_past"), bool):
             raise ValueError(f"{variant} needs policy.use_past true (Pi05_past) or false (its no-past control)")
         if not policy.use_past and training.get("validate_generated_history"):
@@ -193,10 +196,13 @@ def validate_config(cfg, variant, task):
                 and (policy.get("train_vision", True) or policy.get("train_lora", True))):
             raise ValueError("kv_grad_scale=0 with lambda_ki=0 leaves the trainable SigLIP/LoRA without a loss")
         # The constructor's checks, here so --dry-run fails before the workers load 14.5 GB of weights.
-        _int(policy.get("flow_num_steps"), "policy.flow_num_steps")
-        beta = list(policy.get("flow_time_beta") or [])
-        if len(beta) != 2 or not all(_number(x, "policy.flow_time_beta") > 0 for x in beta):
-            raise ValueError("policy.flow_time_beta must be two positive numbers")
+        if flow:
+            _int(policy.get("flow_num_steps"), "policy.flow_num_steps")
+            beta = list(policy.get("flow_time_beta") or [])
+            if len(beta) != 2 or not all(_number(x, "policy.flow_time_beta") > 0 for x in beta):
+                raise ValueError("policy.flow_time_beta must be two positive numbers")
+        else:
+            _validate_ar_head(policy, variant)
         if not 0.0 <= _number(policy.get("cond_t0"), "policy.cond_t0") <= 1.0:
             raise ValueError("policy.cond_t0 must lie in [0, 1]")
         if not 0.0 <= _number(policy.get("cond_dropout"), "policy.cond_dropout") < 1.0:
@@ -254,6 +260,23 @@ def validate_config(cfg, variant, task):
         raise ValueError("Training needs drop_last=true (full micro-batches); validation needs drop_last=false")
     if cfg.logging.get("mode") not in ("online", "offline", "disabled"):
         raise ValueError("logging.mode must be online, offline or disabled")
+
+
+def _validate_ar_head(policy, variant):
+    """The AR token head on the Pi05_past stack (pi05_p2n): no flow knobs, the adaRMS fold at the condition's
+    constant time, and valid deployment and self-past samplers (null self-past = the deployment sampler)."""
+    if policy.get("flow_num_steps") is not None or policy.get("flow_time_beta") is not None:
+        raise ValueError(f"{variant} has no flow head: policy.flow_num_steps and policy.flow_time_beta must be null")
+    if _number(policy.get("adarms_t0"), "policy.adarms_t0") != _number(policy.get("cond_t0"), "policy.cond_t0"):
+        raise ValueError("policy.adarms_t0 (the adaRMS fold time) must equal policy.cond_t0")
+    for key in ("temperature", "self_past_temperature"):
+        value = policy.get(key)
+        if key.startswith("self_past") and value is None:
+            continue
+        if _number(value, f"policy.{key}") < 0:
+            raise ValueError(f"policy.{key} must be nonnegative (0 = greedy)")
+    _int(policy.get("topk"), "policy.topk")
+    _int(policy.get("self_past_topk"), "policy.self_past_topk", allow_none=True)
 
 
 LIBERO_OFFICIAL_INIT_STATES = 50  # fixed initial states per task in LIBERO's init_states files
@@ -388,6 +411,8 @@ def describe(cfg, world_size, output, mode):
             "self_past": {key: policy.get(key) for key in ("self_past_p", "self_past_warmup_steps",
                                                             "self_past_ramp_steps", "self_past_chunk_size",
                                                             "self_past_temperature", "self_past_topk")},
+            **({} if VARIANTS[cfg.variant]["flow"] else
+               {"deployment_sampler": {key: policy.get(key) for key in ("temperature", "topk")}}),
             "optimizer": _plain(cfg.optimizer), "ema": _plain(cfg.ema),
             "schedule": expected_schedule(cfg, None, world_size),
             "assets": {key: policy.get(key) for key in ("pi05_weights", "pi05_sha256", "spm_path", "spm_sha256",
