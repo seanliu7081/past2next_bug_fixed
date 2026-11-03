@@ -54,6 +54,7 @@ POLICY_TARGETS = {
     "oat.policy.pi05_ki_flow.PI05KIFlowPolicy": "pi05_ki_flow",
     "oat.policy.pi05_past.Pi05PastPolicy": "pi05_past",
     "oat.policy.pi05_p2n.Pi05P2NPolicy": "pi05_p2n",
+    "oat.policy.pi05_p2n_vlm_v1.Pi05P2NVLMV1Policy": "pi05_p2n_vlm_v1",
 }
 RUNNERS = {False: "P2NNewLiberoRunner", True: "P2NStateGateNewLiberoRunner"}
 INFERENCE_KEYS = ("temperature", "topk", "use_k_tokens")
@@ -547,7 +548,8 @@ def main(argv=None):
             "ema": run_metadata.get("ema"), "checkpoint_kind": run_metadata.get("kind"),
             "policy_metadata": {key: value for key, value in payload["metadata"].items()
                                 if key in ("variant", "variant_code", "model_size", "pi05", "tokenizer",
-                                           "sentencepiece", "prompt", "parameters", "artifact_schema")},
+                                           "sentencepiece", "prompt", "parameters", "artifact_schema",
+                                           "context_schema", "pi05_p2n_vlm_v1")},
             "assets": asset_metadata(policy, args), "module_paths": modules, "package_versions": versions,
             "effective_inference": inference, "history_intervention": intervention,
             "runner_target": runner_config["_target_"],

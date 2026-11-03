@@ -93,7 +93,7 @@ register_new_resolvers()
 
 CHECKPOINT_FORMAT = "p2n_vla_checkpoint_v1"
 POLICY_FAMILY = "p2n_vla"
-VARIANTS = ("p2n_vla", "p2n_vla_state_gate", "pi05_ki_flow", "pi05_past", "pi05_p2n")
+VARIANTS = ("p2n_vla", "p2n_vla_state_gate", "pi05_ki_flow", "pi05_past", "pi05_p2n", "pi05_p2n_vlm_v1")
 CLIP_GROUP_NAMES = ("ar", "ki")
 OPTIMIZER_GROUP_NAMES = ("pretrained", "new")
 OPTIMIZER_KEYS = ("policy_lr", "new_module_lr", "weight_decay", "betas", "eps", "fused")
@@ -105,7 +105,8 @@ RESUME_TOP_LEVEL_KEYS = ("variant", "task_type", "horizon", "n_action_steps", "n
 SOURCE_FILES = ("oat/workspace/train_p2n_vla.py", "oat/model/common/trainable_ema.py",
                 "scripts/train_p2n_vla.py", "oat/config/train_p2n_vla.yaml",
                 "oat/config/train_p2n_vla_state_gate.yaml", "oat/config/train_pi05_ki_flow.yaml",
-                "oat/config/train_pi05_past.yaml", "oat/config/train_pi05_p2n.yaml")
+                "oat/config/train_pi05_past.yaml", "oat/config/train_pi05_p2n.yaml",
+                "oat/config/train_pi05_p2n_vlm_v1.yaml")
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 GIB = float(2 ** 30)
 
@@ -1149,7 +1150,7 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
     # ----------------------------------------------------------------- validation
     @torch.no_grad()
     def _validate(self, run: _Run, max_batches=None):
-        """Expert/generated-history losses and stateless reconstruction MSE under the EMA."""
+        """History-conditioned losses and free-running predictions under EMA/live weights."""
         cfg, accelerator, policy = self.cfg, run.accelerator, run.policy
         device = accelerator.device
         generated = (bool(cfg.training.get("validate_generated_history", True))
@@ -1185,7 +1186,8 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                         items["loss"] = float(loss)
                         sums.add_all(items, weight, prefix=f"{mode}/")
                     if recon_cap is None or batch_index < int(recon_cap):
-                        prediction = predict_validation_action(policy, batch)["action_pred"]
+                        outputs = predict_validation_action(policy, batch)
+                        prediction = outputs["action_pred"]
                         target = batch["action"]
                         if prediction.shape != target.shape:
                             raise ValueError(f"predict_action returned {tuple(prediction.shape)}, "
@@ -1194,6 +1196,21 @@ class TrainP2NVLAWorkspace(BaseWorkspace):
                         sums.add("reconstruction_mse", float(error.mean()), weight)
                         executed = int(getattr(policy, "n_action_steps", cfg.n_action_steps))
                         sums.add("reconstruction_mse_executed", float(error[:, :executed].mean()), weight)
+                        if "action_tokens" in outputs:
+                            # The same free-running decode supplies these IDs; history is the expert history
+                            # passed by predict_validation_action, independently of the loss modes above.
+                            tokens = outputs["action_tokens"]
+                            target_tokens = policy.encode_targets(target)
+                            if tokens.shape != target_tokens.shape:
+                                raise ValueError(f"action_tokens returned {tuple(tokens.shape)}, "
+                                                 f"expected {tuple(target_tokens.shape)}")
+                            correct = tokens == target_tokens
+                            sums.add("free_running_token_acc", float(correct.float().mean()), weight)
+                            sums.add("full_sequence_acc", float(correct.all(dim=-1).float().mean()), weight)
+                            normalizer = policy.action_normalizer["action"]
+                            normalized_error = (normalizer.normalize(prediction[:, :executed].float())
+                                                - normalizer.normalize(target[:, :executed].float())).square()
+                            sums.add("normalized_executed_action_mse", float(normalized_error.mean()), weight)
                     gate = getattr(policy, "get_history_gate_metrics", None)
                     if callable(gate):
                         sums.add_all(scalar_items(gate()), weight, prefix="gate/")

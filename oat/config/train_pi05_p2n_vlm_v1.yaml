@@ -1,0 +1,76 @@
+# Native Gemma-2B autoregressive OAT prediction with continuous Past2Next history.
+# The recipe matches pi05_p2n; the 300M action expert is absent. See docs/PI05_P2N_VLM_V1.md.
+defaults:
+  - train_p2n_vla
+  - _self_
+
+name: train_pi05_p2n_vlm_v1
+variant: pi05_p2n_vlm_v1
+
+policy:
+  _target_: oat.policy.pi05_p2n_vlm_v1.Pi05P2NVLMV1Policy
+  spm_path: /workspace/ysk/past2next_bug_fixed/data/pretrained/p2n_vla/paligemma_tokenizer.model
+  tokenizer_checkpoint: /workspace/ysk/past2next_bug_fixed/data/pretrained/p2n_vla/oat_from_upd030000.ckpt
+  # Disable inherited settings that belong to the expert/KI path. The native head rejects non-null values.
+  lambda_ki: null
+  ki_skip: null
+  adarms_t0: null
+  use_past: true
+  cond_dropout: 0.1
+  train_vision: true
+  vision_activation_checkpointing: true
+  train_lora: true
+  lora_rank: 32
+  lora_alpha: 32.0
+  temperature: 0.0
+  topk: 10
+  # Preserve the baseline sampler for the first architecture comparison.
+  self_past_p: 0.5
+  self_past_warmup_steps: 1000
+  self_past_ramp_steps: 0
+  self_past_chunk_size: 4
+  self_past_temperature: 1.0
+  self_past_topk: 10
+  self_past_schedule: optimizer_step
+
+training:
+  validate_generated_history: true
+  # Default: micro-batch 4 x 2 GPUs x accumulation 4 = 32. The launcher adapts accumulation to GPU count.
+  gradient_accumulate_every: 4
+  max_train_steps: ${eval:'100 * ${training.gradient_accumulate_every}'}
+  num_epochs: 800
+  max_optimizer_steps: 80000
+  lr_warmup_steps: 1000
+  min_lr_ratio: 0.1
+  max_grad_norm: 1.0
+  use_ema: false
+  val_every: 50
+  max_val_steps: 200
+  max_reconst_steps: 200
+  checkpoint_every: 10
+  snapshot_every: 0
+  keep_snapshots: all
+  rollout_every: 100
+  keep_resume_checkpoint: true
+  allow_dataset_change: false
+
+optimizer:
+  policy_lr: 5.0e-5
+  new_module_lr: 1.0e-4
+  weight_decay: 1.0e-10
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  fused: null
+
+dataloader:
+  batch_size: 4
+
+val_dataloader:
+  batch_size: 4
+
+task:
+  policy:
+    lazy_eval: false
+
+logging:
+  tags: ['${variant}', '${task_name}', 'pi05_base', 'native_vlm_ar', 'p2n_history_prefix']

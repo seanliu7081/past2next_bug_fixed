@@ -49,6 +49,9 @@ VARIANTS = {
     # Pi05_past with the Past2Next self-past AR head over 8 OAT tokens instead of flow (docs/PI05_P2N.md).
     "pi05_p2n": {"config": "train_pi05_p2n", "target": "oat.policy.pi05_p2n.Pi05P2NPolicy",
                  "gate": False, "flow": False, "past": True},
+    "pi05_p2n_vlm_v1": {"config": "train_pi05_p2n_vlm_v1",
+                        "target": "oat.policy.pi05_p2n_vlm_v1.Pi05P2NVLMV1Policy",
+                        "gate": False, "flow": False, "native_vlm_ar": True},
 }
 TASKS = ("libero",)
 DATASET_TARGETS = {False: "oat.dataset.vla_dataset.VLAZarrDatasetWithPrevWindow",
@@ -183,7 +186,9 @@ def validate_config(cfg, variant, task):
                 raise ValueError(f"policy and {name} state-history keys/steps must agree")
         if policy.get("use_past") is not True:
             raise ValueError("The gate variant needs past conditioning (use_past=true)")
-    if spec.get("past", False):
+    if spec.get("native_vlm_ar", False):
+        _validate_native_vlm_ar(cfg, variant)
+    elif spec.get("past", False):
         if not isinstance(policy.get("use_past"), bool):
             raise ValueError(f"{variant} needs policy.use_past true (Pi05_past) or false (its no-past control)")
         if not policy.use_past and training.get("validate_generated_history"):
@@ -225,9 +230,10 @@ def validate_config(cfg, variant, task):
             raise ValueError("pi05_ki_flow takes no past input: set policy.use_past=false")
         if training.get("validate_generated_history"):
             raise ValueError("pi05_ki_flow has no generated-history validation")
-    lambda_ki = float(policy.get("lambda_ki", 1.0))
-    if not math.isfinite(lambda_ki) or lambda_ki < 0:
-        raise ValueError("policy.lambda_ki must be finite and nonnegative")
+    if not spec.get("native_vlm_ar", False):
+        lambda_ki = float(policy.get("lambda_ki", 1.0))
+        if not math.isfinite(lambda_ki) or lambda_ki < 0:
+            raise ValueError("policy.lambda_ki must be finite and nonnegative")
     _int(policy.get("lora_rank"), "policy.lora_rank")
     if not 0.0 <= float(policy.get("self_past_p", 0.0)) <= 1.0:
         raise ValueError("policy.self_past_p must lie in [0, 1]")
@@ -269,6 +275,11 @@ def _validate_ar_head(policy, variant):
         raise ValueError(f"{variant} has no flow head: policy.flow_num_steps and policy.flow_time_beta must be null")
     if _number(policy.get("adarms_t0"), "policy.adarms_t0") != _number(policy.get("cond_t0"), "policy.cond_t0"):
         raise ValueError("policy.adarms_t0 (the adaRMS fold time) must equal policy.cond_t0")
+    _validate_token_sampler(policy)
+
+
+def _validate_token_sampler(policy):
+    """Shared AR sampler validation, independent of the expert's normalization."""
     for key in ("temperature", "self_past_temperature"):
         value = policy.get(key)
         if key.startswith("self_past") and value is None:
@@ -277,6 +288,37 @@ def _validate_ar_head(policy, variant):
             raise ValueError(f"policy.{key} must be nonnegative (0 = greedy)")
     _int(policy.get("topk"), "policy.topk")
     _int(policy.get("self_past_topk"), "policy.self_past_topk", allow_none=True)
+
+
+def _validate_native_vlm_ar(cfg, variant):
+    """Native VLM action CE has no expert, flow time, KV insulation or auxiliary KI loss."""
+    policy = cfg.policy
+    for key in ("lambda_ki", "ki_skip", "ki_init", "adarms_t0", "cond_t0", "kv_grad_scale",
+                "flow_num_steps", "flow_time_beta"):
+        if policy.get(key) is not None:
+            raise ValueError(f"{variant} has no expert/flow/KI path: policy.{key} must be null or absent")
+    if not isinstance(policy.get("use_past"), bool):
+        raise ValueError(f"{variant} needs boolean policy.use_past")
+    if not policy.use_past and cfg.training.get("validate_generated_history"):
+        raise ValueError(f"{variant} with use_past=false has no generated history: "
+                         "set training.validate_generated_history=false")
+    if not 0.0 <= _number(policy.get("cond_dropout"), "policy.cond_dropout") < 1.0:
+        raise ValueError("policy.cond_dropout must lie in [0, 1)")
+    for key in ("train_vision", "train_lora", "vision_activation_checkpointing"):
+        if not isinstance(policy.get(key), bool):
+            raise ValueError(f"policy.{key} must be a boolean")
+    if not _number(policy.get("lora_alpha"), "policy.lora_alpha") > 0:
+        raise ValueError("policy.lora_alpha must be positive")
+    for key in ("self_past_warmup_steps", "self_past_ramp_steps"):
+        _int(policy.get(key), f"policy.{key}", minimum=0)
+    _int(policy.get("self_past_chunk_size"), "policy.self_past_chunk_size")
+    if policy.get("self_past_schedule") != "optimizer_step":
+        raise ValueError("policy.self_past_schedule must be optimizer_step")
+    for key in ("policy_lr", "new_module_lr", "weight_decay"):
+        if _number(cfg.optimizer.get(key), f"optimizer.{key}") < 0:
+            raise ValueError(f"optimizer.{key} must be nonnegative")
+    _int(cfg.get("seed"), "seed", minimum=0)
+    _validate_token_sampler(policy)
 
 
 LIBERO_OFFICIAL_INIT_STATES = 50  # fixed initial states per task in LIBERO's init_states files
@@ -407,7 +449,7 @@ def describe(cfg, world_size, output, mode):
     policy = cfg.policy
     return {"mode": mode, "variant": cfg.variant, "task": cfg.task_type, "policy": policy._target_,
             "model_size": policy.model_size, "output": str(output), "world_size": world_size,
-            "lambda_ki": policy.lambda_ki, "lora": [policy.lora_rank, policy.lora_alpha],
+            "lambda_ki": policy.get("lambda_ki"), "lora": [policy.lora_rank, policy.lora_alpha],
             "self_past": {key: policy.get(key) for key in ("self_past_p", "self_past_warmup_steps",
                                                             "self_past_ramp_steps", "self_past_chunk_size",
                                                             "self_past_temperature", "self_past_topk")},
@@ -778,6 +820,15 @@ def main(argv=None):
         if args.probe_self_past_step is not None:
             generated.append(f"training.probe.self_past_step={args.probe_self_past_step}")
     cfg = compose_config(args.variant, args.task, [*generated, *overrides], config_dir=args.config_dir)
+    if VARIANTS[args.variant].get("native_vlm_ar", False) and not any(
+            item.lstrip("+").split("=", 1)[0] == "training.gradient_accumulate_every" for item in overrides):
+        # Match the expert-AR baseline's batch of 32 on 1/2/4/8 GPUs. Explicit Hydra overrides are authoritative.
+        micro_batch = int(cfg.dataloader.batch_size) * world_size
+        if 32 % micro_batch:
+            parser.error("batch 32 must be divisible by dataloader.batch_size x world size; "
+                         "set training.gradient_accumulate_every explicitly to use a different batch")
+        cfg.training.gradient_accumulate_every = 32 // micro_batch
+        validate_config(cfg, args.variant, args.task)
     from omegaconf import OmegaConf
     if args.output is not None:
         output = args.output.expanduser().resolve()

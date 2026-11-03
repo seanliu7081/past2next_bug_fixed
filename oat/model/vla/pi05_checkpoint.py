@@ -22,6 +22,7 @@ import torch.nn.functional as F
 
 from oat.model.vla.flow_head import FlowHeads, posemb_sincos
 from oat.model.vla.gemma_joint import AdaRMSNorm, GemmaJoint, SegmentRMSNorm
+from oat.model.vla.gemma_vlm import GemmaVLM
 from oat.model.vla.siglip import SiglipEncoder
 
 PI05_REPO = "lerobot/pi05_base"
@@ -87,8 +88,8 @@ class LoadReport:
     sha256: Optional[str] = None
 
 
-def _plain_targets(siglip: SiglipEncoder, joint: GemmaJoint, flow_heads: Optional[FlowHeads]) -> Dict[str, Tensor]:
-    """Checkpoint key -> destination tensor for every directly copied parameter."""
+def _vlm_targets(siglip: SiglipEncoder, joint) -> Dict[str, Tensor]:
+    """Checkpoint destinations shared by the joint and VLM-only backbones."""
     targets: Dict[str, Tensor] = {}
     for name, tensor in siglip.vision.state_dict(keep_vars=True).items():
         targets[SIGLIP_PREFIX + name] = tensor
@@ -110,6 +111,12 @@ def _plain_targets(siglip: SiglipEncoder, joint: GemmaJoint, flow_heads: Optiona
                 raise RuntimeError("Load pi05 weights before injecting LoRA")
             targets[f"{base}mlp.{proj}.weight"] = module.weight
     targets[VLM_PREFIX + "norm.weight"] = joint.vlm.norm.weight
+    return targets
+
+
+def _plain_targets(siglip: SiglipEncoder, joint: GemmaJoint, flow_heads: Optional[FlowHeads]) -> Dict[str, Tensor]:
+    """Checkpoint key -> destination tensor for every directly copied parameter."""
+    targets = _vlm_targets(siglip, joint)
     for index, layer in enumerate(joint.expert.layers):
         base = f"{EXPERT_PREFIX}layers.{index}."
         for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
@@ -226,4 +233,58 @@ def load_pi05(path, *, siglip: SiglipEncoder, joint: GemmaJoint, mode: Literal["
     leftovers = sorted(keys - set(report.consumed) - set(report.dropped))
     if strict and leftovers:
         raise KeyError(f"Unaccounted pi05 tensors: {leftovers[:5]}")
+    return report
+
+
+def _vlm_only_drop_allowed(key: str) -> bool:
+    """Exact known expert/flow tensor families; unexpected keys still fail strict loading."""
+    if key == EXPERT_LM_HEAD or key in {
+            f"{name}.{suffix}" for name in FLOW_HEAD_NAMES for suffix in ("weight", "bias")}:
+        return True
+    return re.fullmatch(
+        re.escape(EXPERT_PREFIX)
+        + r"(?:layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)\.weight"
+          r"|mlp\.(?:gate_proj|up_proj|down_proj)\.weight"
+          r"|(?:input_layernorm|post_attention_layernorm)\.dense\.(?:weight|bias))"
+          r"|norm\.dense\.(?:weight|bias))", key) is not None
+
+
+@torch.no_grad()
+def load_pi05_vlm(path, *, siglip: SiglipEncoder, joint: GemmaVLM, strict: bool = True,
+                  expected_sha256: Optional[str] = None, verify_sha256: bool = False) -> LoadReport:
+    """Load only SigLIP/projector/Gemma, explicitly dropping the unused PI0.5 expert.
+
+    No expert or flow tensors are materialized, and no time-conditioning fold is
+    performed. Call before injecting LoRA, as for ``load_pi05``.
+    """
+    from safetensors import safe_open
+
+    if not isinstance(joint, GemmaVLM):
+        raise TypeError("load_pi05_vlm needs a GemmaVLM without an action expert")
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"pi05 weights not found: {path}")
+    sha = resolved_blob_sha256(path)
+    if verify_sha256 or (expected_sha256 and sha is None):
+        sha = file_sha256(path)
+    if expected_sha256 is not None and sha != expected_sha256:
+        raise ValueError(f"pi05 weights sha256 {sha} != expected {expected_sha256}")
+    targets = _vlm_targets(siglip, joint)
+    report = LoadReport(mode="vlm", sha256=sha)
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        keys = set(handle.keys())
+        missing = sorted(set(targets) - keys)
+        if missing:
+            raise KeyError(f"{len(missing)} VLM destination tensors are missing, e.g. {missing[:5]}")
+        extra = keys - set(targets)
+        unexpected = sorted(key for key in extra if not _vlm_only_drop_allowed(key))
+        if strict and unexpected:
+            raise KeyError(f"Unexpected pi05 checkpoint tensors: {unexpected[:5]}")
+        for key, destination in targets.items():
+            tensor = handle.get_tensor(key)
+            if tuple(tensor.shape) != tuple(destination.shape):
+                raise ValueError(f"{key}: checkpoint shape {tuple(tensor.shape)} != {tuple(destination.shape)}")
+            destination.copy_(tensor.to(device=destination.device, dtype=destination.dtype))
+            report.consumed.append(key)
+        report.dropped = sorted(extra)
     return report
