@@ -23,8 +23,14 @@ bash train_pi05_p2n_vlm_v1.sh --devices 0,1 \
 # Continue a run; preserve its GPU count and recipe.
 bash train_pi05_p2n_vlm_v1.sh --devices 0,1 \
   --resume output/training/pi05_p2n_vlm_v1_seed42/checkpoints/latest.ckpt
+
+# The same recipe plus an fp32 EMA of the trainables. Resume it with this launcher too.
+bash train_pi05_p2n_vlm_v1_ema.sh --devices 0,1,2,3 \
+  --output output/training/pi05_p2n_vlm_v1_ema_libero10_seed42
 ```
 
 The launcher automatically chooses accumulation to keep batch 32 on 1/2/4/8 GPUs. An explicit Hydra `training.gradient_accumulate_every` override takes precedence. Other overrides follow `--`; e.g. `-- policy.use_past=false policy.self_past_p=0 training.validate_generated_history=false` selects the no-history control. Logging defaults to offline; use `logging.mode=online` when desired. The inherited `lambda_ki`, `ki_skip` and `adarms_t0` fields are null placeholders; non-null values are rejected.
+
+`train_pi05_p2n_vlm_v1_ema.sh` takes the same arguments. It adds `training.use_ema=true ema.decay=0.9998 ema.warmup_power=0.85` and an `ema` logging tag ahead of any `--` overrides, so those overrides take precedence. The decay `min(0.9998, 1-(1+n)^-0.85)` has a time constant of about 2.5k updates at update 10k and 5k from about update 22.5k on; at the cap, 90% of the weight covers the last ~11.5k updates. The average therefore lags the live weights, so the 10k–20k rollouts can read low. Validation, in-training rollouts and `snapshots/upd-NNNNNN_ema.ckpt` (bf16) use the EMA weights; evaluate those snapshots with the default `--weights ema`, since `--weights model` fails on them. `checkpoints/latest.ckpt` stores both the live and the EMA weights in fp32, so evaluating it with `--weights model` and with `--weights ema` compares them at the same update. A 4-GPU probe measured a peak of 14.73 GiB reserved per training GPU, 1.78 GiB more than without EMA. It also measured 18.6 GB on the rollout GPU and 13.6 samples/s.
 
 Evaluate saved weights using `scripts/evaluate_p2n_vla.py` with the same task schedule, initial states and seeds as the baseline. Offline validation also records `val/free_running_token_acc`, `val/full_sequence_acc` and `val/normalized_executed_action_mse` from the existing reconstruction decode with expert history. Compare these with held-out teacher-forced token accuracy, closed-loop success and inference latency. A higher training token accuracy alone does not establish improvement. Delete disposable probe output once its results have been recorded; retain real training checkpoints and regression tests.

@@ -1,4 +1,5 @@
 """Native VLM v1 integration: recipe, explicit unsupported knobs, and launch batching."""
+import json
 from pathlib import Path
 import subprocess
 
@@ -84,3 +85,33 @@ def test_native_shell_wrapper_routes_variant_without_outputs(tmp_path):
     refused = subprocess.run(["bash", str(script), "--variant", "pi05_past"],
                              cwd=REPO, capture_output=True, text=True, timeout=30)
     assert refused.returncode == 2 and "fixes --variant" in refused.stderr
+
+
+def _dry_run_summary(stdout):
+    lines = stdout.splitlines()
+    start = lines.index("{")
+    end = len(lines) - 1 - lines[::-1].index("}")
+    return json.loads("\n".join(lines[start:end + 1]))
+
+
+def test_ema_shell_wrapper_enables_ema_and_lets_later_overrides_win(tmp_path):
+    script = REPO / "train_pi05_p2n_vlm_v1_ema.sh"
+
+    def dry_run(*extra):
+        return subprocess.run(["bash", str(script), "--devices", "0,1,2,3", "--dry-run", "--output", str(tmp_path),
+                               *extra], cwd=REPO, capture_output=True, text=True, timeout=120)
+
+    result = dry_run()
+    assert result.returncode == 0, result.stderr[-2000:]
+    summary = _dry_run_summary(result.stdout)
+    assert summary["variant"] == VARIANT and summary["schedule"]["effective_batch"] == 32
+    assert summary["ema"] == {"decay": 0.9998, "warmup_power": 0.85}
+    assert summary["rollout"]["weights"] == "ema"
+    assert "  - ema" in result.stdout.splitlines()
+    overridden = dry_run("--", "ema.decay=0.999")
+    assert overridden.returncode == 0, overridden.stderr[-2000:]
+    assert _dry_run_summary(overridden.stdout)["ema"] == {"decay": 0.999, "warmup_power": 0.85}
+    for override in ("training.use_ema=false", "++training.use_ema=false"):
+        refused = dry_run("--", override)
+        assert refused.returncode == 2 and "always enables EMA" in refused.stderr
+    assert not list(tmp_path.iterdir())
