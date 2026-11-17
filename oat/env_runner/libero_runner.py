@@ -9,7 +9,7 @@ import json
 import os
 import tempfile
 import time
-import wandb.sdk.data_types.video as wandb_video
+from uuid import uuid4
 
 from oat.gymnasium_util.multistep_wrapper import MultiStepWrapper
 from oat.gymnasium_util.video_recording_wrapper import VideoRecordingWrapper, VideoRecorder
@@ -195,7 +195,7 @@ class LiberoRunner(BaseRunner):
                 env.env.file_path = None
                 if enable_render:
                     filename = pathlib.Path(output_dir).joinpath(
-                        f'media/{task_name}', wandb_video.util.generate_id() + '.mp4'
+                        f'media/{task_name}', uuid4().hex + '.mp4'
                     )
                     filename.parent.mkdir(parents=True, exist_ok=True)
                     filename = str(filename)

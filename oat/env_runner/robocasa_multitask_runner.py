@@ -7,13 +7,13 @@ next scheduled reset.
 
 import math
 import pathlib
+from uuid import uuid4
 
 import dill
 import numpy as np
 import torch
 import tqdm
 import wandb
-import wandb.sdk.data_types.video as wandb_video
 
 from oat.gymnasium_util.multistep_wrapper import MultiStepWrapper
 from oat.gymnasium_util.video_recording_wrapper import VideoRecordingWrapper, VideoRecorder
@@ -163,7 +163,7 @@ class RoboCasaMultiTaskRunner(BaseRunner):
                 if enable_render:
                     filename = pathlib.Path(output_dir).joinpath(
                         f"media/{task_name}",
-                        wandb_video.util.generate_id() + ".mp4",
+                        uuid4().hex + ".mp4",
                     )
                     filename.parent.mkdir(parents=True, exist_ok=True)
                     filename = str(filename)
