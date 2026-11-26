@@ -121,7 +121,7 @@ def config(config_name='train_past2next_scratch'):
 
 
 def run_tiny(tmp_path, monkeypatch, cfg, validation_length=2, forbid_validation=False,
-             tracker_config=None, loader_shards=1, tracker_run=None):
+             tracker_config=None, loader_shards=1, tracker_run=None, runner_factory=None):
     policy = TinyPolicy()
     dataset = TinyDataset(validation_length=validation_length)
     original_get_validation = dataset.get_validation_dataset
@@ -135,6 +135,8 @@ def run_tiny(tmp_path, monkeypatch, cfg, validation_length=2, forbid_validation=
             return policy
         if node._target_ == 'test.TinyDataset':
             return dataset
+        if node._target_ == 'test.TinyRunner' and runner_factory is not None:
+            return runner_factory(policy, **kwargs)
         raise AssertionError(f'Unexpected instantiation: {node}')
     def cpu_accelerator(**kwargs):
         kwargs.pop('log_with')
@@ -170,6 +172,46 @@ def run_tiny(tmp_path, monkeypatch, cfg, validation_length=2, forbid_validation=
     assert all(math.isfinite(float(value)) for row in rows for value in row.values()
                if isinstance(value, (int, float)))
     return workspace, policy, dataset, rows[-1]
+
+
+def test_rollout_workers_exist_only_between_training_epochs(tmp_path, monkeypatch):
+    cfg = config()
+    cfg.training.num_epochs = 3
+    cfg.training.rollout_every = 2
+    cfg.task.policy.lazy_eval = False
+    cfg.task.policy.env_runner = {'_target_': 'test.TinyRunner'}
+    events = []
+    active = []
+    original_forward = TinyPolicy.forward
+
+    def forward(policy, batch):
+        if policy.training:
+            assert not active, 'Training resumed before simulator cleanup'
+        return original_forward(policy, batch)
+
+    class TinyRunner:
+        def __init__(self, policy, **kwargs):
+            assert not policy.training
+            active.append(self)
+            self.policy = policy
+            events.append(('create', policy.training_calls))
+
+        def run(self, policy):
+            assert policy is self.policy and not policy.training
+            events.append(('evaluate', policy.training_calls))
+            return {'mean_success_rate': 0.5}
+
+        def close(self):
+            events.append(('close', self.policy.training_calls))
+            active.remove(self)
+
+    monkeypatch.setattr(TinyPolicy, 'forward', forward)
+    ws, policy, _, row = run_tiny(tmp_path, monkeypatch, cfg, runner_factory=TinyRunner)
+    assert events == [('create', 2), ('evaluate', 2), ('close', 2),
+                      ('create', 6), ('evaluate', 6), ('close', 6)]
+    assert not active
+    assert ws.completed_optimizer_steps == policy.training_calls == 6
+    assert row['mean_success_rate'] == 0.5
 
 
 @pytest.mark.parametrize('config_name, validation_length, validation_enabled', [

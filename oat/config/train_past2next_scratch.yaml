@@ -52,11 +52,11 @@ training:
   resume: False
   allow_bf16: True
   max_grad_norm: 1.0
-  num_epochs: 251
+  num_epochs: 5001
   val_every: 1
   sample_every: 1
-  rollout_every: 25
-  checkpoint_every: 25
+  rollout_every: 200
+  checkpoint_every: 100
   lr_scheduler: cosine
   lr_warmup_steps: 100
   gradient_accumulate_every: 1
@@ -68,7 +68,7 @@ training:
   num_demo: 500
   tqdm_interval_sec: 1.0
   init_checkpoint: null
-  snapshot_every: 25
+  snapshot_every: 200
   validate_generated_history: True
 
 ema:

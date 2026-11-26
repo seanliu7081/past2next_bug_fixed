@@ -11,7 +11,10 @@ import os
 import time
 import json
 import numbers
+import random
 import hydra
+import numpy as np
+from contextlib import nullcontext
 from datetime import timedelta
 import torch
 import torch.nn.functional as F
@@ -29,6 +32,8 @@ from typing import Union
 from oat.workspace.base_workspace import BaseWorkspace
 from oat.dataset.base_dataset import BaseDataset
 from oat.env_runner.base_runner import BaseRunner
+from oat.env_runner.p2n_new_convnext_libero10_runner import renderer_env
+from oat.env_runner.p2n_vla_rollout import close_runner, resolve_renderer
 from oat.common.checkpoint_util import TopKCheckpointManager
 from oat.common.json_logger import JsonLogger
 from oat.common.hydra_util import register_new_resolvers
@@ -288,12 +293,82 @@ class TrainPolicyWorkspace(BaseWorkspace):
             return policy.predict_action(batch["obs"], past_actions=batch["past_action"])
         return policy.predict_action(batch["obs"])
 
+    def _run_policy_rollout(self, accelerator, policy, runner_config, renderer=None):
+        """Pause every training rank and release simulator VRAM before resuming."""
+        accelerator.wait_for_everyone()
+        runner_log = {}
+        if accelerator.is_main_process:
+            device = accelerator.device
+            cuda_devices = []
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()
+                cuda_devices = [device.index if device.index is not None
+                                else torch.cuda.current_device()]
+            python_rng, numpy_rng = random.getstate(), np.random.get_state()
+            runner = None
+            failed = True
+            try:
+                with torch.random.fork_rng(devices=cuda_devices):
+                    try:
+                        # EGL ordinals can differ from CUDA ordinals. Only simulator
+                        # construction and its forked workers receive the EGL mask.
+                        scope = (renderer_env(renderer["egl_device_id"])
+                                 if renderer is not None else nullcontext())
+                        with scope:
+                            runner: BaseRunner = hydra.utils.instantiate(
+                                runner_config, output_dir=self.output_dir)
+                        runner_log = runner.run(policy) or {}
+                        failed = False
+                    finally:
+                        if runner is not None:
+                            close_runner(runner, force=failed)
+            finally:
+                random.setstate(python_rng)
+                np.random.set_state(numpy_rng)
+        # No rank returns to training while the evaluation workers hold VRAM.
+        accelerator.wait_for_everyone()
+        return runner_log
+
+    @staticmethod
+    def _bind_distributed_cuda_device():
+        """Bind torchrun ranks before Accelerate initializes the NCCL group."""
+        local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+        use_cpu = os.environ.get("ACCELERATE_USE_CPU", "false").lower() in {
+            "1", "true", "yes", "on",
+        }
+        override = os.environ.get("ACCELERATE_TORCH_DEVICE")
+        override_device = torch.device(override) if override else None
+        if (local_rank < 0 or use_cpu
+                or (override_device is not None and override_device.type != "cuda")
+                or not torch.cuda.is_available()):
+            return None
+
+        device_count = torch.cuda.device_count()
+        if local_rank >= device_count:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank}, but only {device_count} CUDA devices are visible "
+                f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}). "
+                "Expose one GPU per local torchrun process or reduce --nproc_per_node."
+            )
+        device = torch.device("cuda", local_rank)
+        if (override_device is not None and override_device.index is not None
+                and override_device.index != local_rank):
+            raise RuntimeError(
+                f"ACCELERATE_TORCH_DEVICE={override!r} conflicts with LOCAL_RANK={local_rank} "
+                f"({device}). Unset ACCELERATE_TORCH_DEVICE for multi-GPU torchrun."
+            )
+        torch.cuda.set_device(device)
+        return device
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
         init_checkpoint = cfg.training.get("init_checkpoint")
         if init_checkpoint and cfg.training.resume:
             raise ValueError("Fine-tuning with init_checkpoint requires training.resume=false")
 
+        # Select this rank's GPU before NCCL sees the default CUDA device.
+        expected_device = self._bind_distributed_cuda_device()
         # configure accelerator
         accelerator = Accelerator(
             log_with="wandb",
@@ -305,6 +380,21 @@ class TrainPolicyWorkspace(BaseWorkspace):
             mixed_precision="bf16" if cfg.training.allow_bf16 and detect_bf16_support() else "no",
         )
         device = accelerator.device
+        if expected_device is not None and (
+            device.type != "cuda" or device.index not in (None, expected_device.index)
+        ):
+            raise RuntimeError(
+                f"LOCAL_RANK={expected_device.index} requires {expected_device}, "
+                f"but Accelerate selected {device}. Check distributed device overrides."
+            )
+        if device.type == "cuda":
+            properties = torch.cuda.get_device_properties(device)
+            print(
+                f"[rank {accelerator.process_index}] LOCAL_RANK={accelerator.local_process_index} "
+                f"device={device} GPU_UUID={getattr(properties, 'uuid', 'unavailable')} "
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}",
+                flush=True,
+            )
 
         # set seed
         seed = int(cfg.training.seed)
@@ -345,13 +435,22 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 **cfg.checkpoint.topk
             )
 
-        # configure env
+        # Resolve rendering by physical GPU identity, without keeping simulator
+        # workers (and their graphics allocations) alive throughout training.
         lazy_eval = cfg.task.policy.lazy_eval  # don't eval during training
+        rollout_renderer = None
         if (not lazy_eval) and accelerator.is_main_process:
-            env_runner: BaseRunner = hydra.utils.instantiate(
-                cfg.task.policy.env_runner,
-                output_dir=self.output_dir
-            )
+            target = str(cfg.task.policy.env_runner._target_)
+            module, _, runner_name = target.rpartition(".")
+            if "libero" in module or runner_name.startswith("Libero"):
+                rollout_renderer = resolve_renderer(device)
+                if rollout_renderer is not None:
+                    accelerator.print(
+                        f"Evaluation renders on the training GPU "
+                        f"{rollout_renderer['uuid']} "
+                        f"(EGL device {rollout_renderer['egl_device_id']}); "
+                        "all training ranks wait until evaluation and simulator cleanup finish."
+                    )
 
         # resume training
         if cfg.training.resume:
@@ -550,12 +649,11 @@ class TrainPolicyWorkspace(BaseWorkspace):
                 policy.eval()
 
                 # run policy rollout
-                if not lazy_eval:
-                    accelerator.wait_for_everyone()
-                    if accelerator.is_main_process and (self.epoch % cfg.training.rollout_every) == 0:
-                        runner_log = env_runner.run(policy)
+                if not lazy_eval and (self.epoch % cfg.training.rollout_every) == 0:
+                    runner_log = self._run_policy_rollout(
+                        accelerator, policy, cfg.task.policy.env_runner, rollout_renderer)
+                    if accelerator.is_main_process:
                         step_log.update(runner_log)
-                    accelerator.wait_for_everyone()
 
                 # run validation
                 if offline_validation_enabled and (self.epoch % cfg.training.val_every) == 0:
@@ -698,11 +796,6 @@ class TrainPolicyWorkspace(BaseWorkspace):
                     json_logger.log(step_log)
 
         # clean up
-        if not lazy_eval:
-            accelerator.wait_for_everyone()
-            if accelerator.is_main_process and (not lazy_eval):
-                env_runner.close()
-            accelerator.wait_for_everyone()
         accelerator.end_training()
 
 

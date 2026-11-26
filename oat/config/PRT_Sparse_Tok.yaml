@@ -1,0 +1,9 @@
+# The action-only Stage 1 codec learns the same physical reconstruction as PRT.
+# Sparse labels use the frozen decoder and optionally the current policy's confusions.
+defaults:
+  - PRT_Tok
+  - _self_
+
+name: PRT_Sparse_Tok
+tokenizer:
+  _target_: oat.tokenizer.prt_sparse.SparsePRTTokenizer

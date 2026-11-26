@@ -1,0 +1,18 @@
+defaults:
+  - PRT_Policy
+  - _self_
+
+name: PRT_Sparse_Policy
+
+policy:
+  _target_: oat.policy.prt_sparse_policy.SparsePRTPolicy
+  action_tokenizer:
+    _target_: oat.tokenizer.prt_sparse.SparsePRTTokenizer.from_checkpoint
+  sparse_topk: 4  # Current policy proposals, in addition to the local FSQ neighbours.
+  sparse_relative_tolerance: 0.25
+  sparse_absolute_tolerance: 1.0e-7  # MSE in raw arm command units.
+  sparse_decode_batch_size: 128
+  sparse_loss_weight: 1.0  # Set to zero to train with the baseline PRT objective.
+  sparse_risk_weight: 1.0  # Expected shortlist cost above the acceptable threshold.
+
+# Offline validation uses baseline hard-label PRT loss; rollout measures success.

@@ -13,14 +13,15 @@ import os
 
 
 @contextmanager
-def renderer_env():
+def renderer_env(egl_device_id=None):
     """Scope the selected physical EGL device to simulator import/construction."""
     backend = os.environ.get("MUJOCO_GL", "egl").lower().strip()
     if backend != "egl":
         yield
         return
 
-    device = os.environ.get("P2N_LIBERO_EGL_DEVICE_ID")
+    device = (os.environ.get("P2N_LIBERO_EGL_DEVICE_ID")
+              if egl_device_id is None else str(egl_device_id))
     if device is None or not device.isdigit():
         raise RuntimeError(
             "LIBERO EGL evaluation requires P2N_LIBERO_EGL_DEVICE_ID from the "

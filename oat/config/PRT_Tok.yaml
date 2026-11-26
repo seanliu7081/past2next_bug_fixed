@@ -1,0 +1,58 @@
+# Stage 1 PRT uses command windows from the LIBERO-10 demonstrations.
+defaults:
+  - oattok
+  - override task/tokenizer: null
+  - _self_
+
+name: PRT_Tok
+_target_: oat.workspace.train_oattok.TrainPRTWorkspace
+past_n: 7
+
+task:
+  tokenizer:
+    name: libero10
+    lazy_eval: false
+    shape_meta:
+      action:
+        shape: [7]
+    dataset:
+      _target_: oat.dataset.prt_dataset.PRTDataset
+      zarr_path: data/libero/libero10_N${training.num_demo}.zarr
+      past_n: ${past_n}
+      horizon: ${horizon}
+      action_key: action
+      seed: ${seed}
+      val_ratio: 0.1
+      max_train_episodes: null
+
+prior_fit:
+  ridge: 1.0e-3
+  sigma_floor: 1.0e-6
+  batch_size: 1024
+
+tokenizer:
+  _target_: oat.tokenizer.prt.PredictiveResidualTokenizer
+  past_n: ${past_n}
+  gamma: 0.5
+  execution_steps: 8
+  prefix_weight: 2.0
+  integration_weight: 0.1
+  # Stationary AR(1) std as a multiple of the fitted far-horizon residual std.
+  history_noise_std: 0.5
+  history_noise_rho: 0.8
+  initial_gripper: -1.0
+  encoder:
+    sample_dim: 6
+  decoder:
+    sample_dim: 6
+
+val_dataloader:
+  drop_last: false
+
+logging:
+  mode: online
+
+checkpoint:
+  topk:
+    monitor_key: val_arm_prefix_mse
+    format_str: 'ep-{epoch:04d}_prefix-mse-{val_arm_prefix_mse:.6f}.ckpt'

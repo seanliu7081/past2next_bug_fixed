@@ -81,6 +81,34 @@ TOKENIZER="$PWD/output/training/tokenizer/checkpoints/latest.ckpt"
 The checkpoint loader selects its EMA weights when Stage 1 used EMA. Use the same
 selected tokenizer checkpoint for all three policy recipes when comparing them.
 
+### Predictive Residual Tokenizer (PRT)
+
+Train the history-conditioned tokenizer on the local LIBERO-10 demonstrations:
+
+```bash
+python scripts/run_workspace.py --config-name=PRT_Tok \
+    hydra.run.dir=output/training/PRT_Tok
+```
+
+The recipe fits its ridge predictor and residual scales on the training episodes.
+It uses seven previous commands to encode a 16-step chunk as eight arm FSQ IDs
+and one binary-gripper event ID. Validation ranks checkpoints by arm MSE over
+the first eight commands. The numbered files and `latest.ckpt` are in
+`output/training/PRT_Tok/checkpoints/`. Load the trained codec and use the same
+zero-padded command history for encoding and decoding:
+
+```python
+from oat.tokenizer.prt import PredictiveResidualTokenizer
+
+prt = PredictiveResidualTokenizer.from_checkpoint("output/training/PRT_Tok/checkpoints/latest.ckpt")
+arm_ids, grip_event = prt.tokenize(actions, past_actions)  # [B,16,7], [B,7,7]
+reconstructed = prt.detokenize(arm_ids, grip_event, past_actions)
+```
+
+This first-stage recipe expects LIBERO gripper commands in {-1, +1}. It chooses
+the single switch (or hold) with the fewest mismatched steps in a multi-switch chunk.
+The Stage 2 recipes below use the original action-only tokenizer interface.
+
 ## Stage 2: train a policy from scratch
 
 Every policy config requires `policy.action_tokenizer.checkpoint`. It has no default

@@ -1,0 +1,27 @@
+# Stage 2 fits the policy on LIBERO demonstrations using a frozen PRT checkpoint.
+defaults:
+  - train_past2next_scratch
+  - _self_
+
+name: PRT_Policy
+
+policy:
+  _target_: oat.policy.prt_policy.PRTPolicy
+  horizon: ${horizon}
+  action_tokenizer:
+    _target_: oat.tokenizer.prt.PredictiveResidualTokenizer.from_checkpoint
+  history_noise_std: 0.5  # In units of the fitted far-horizon residual std.
+  history_noise_rho: 0.8
+  history_dropout: 0.25
+  innovation_alpha: 1.0
+  innovation_cap: 3.0
+  grip_weight: 1.0
+
+task:
+  policy:
+    lazy_eval: false
+    env_runner:
+      _target_: oat.env_runner.executed_action_runner.LiberoExecutedPastRunner
+
+logging:
+  mode: online

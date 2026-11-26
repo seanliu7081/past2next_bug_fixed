@@ -10,7 +10,6 @@ if __name__ == "__main__":
 import os
 import hydra
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from omegaconf import OmegaConf
 import pathlib
@@ -35,7 +34,7 @@ register_new_resolvers()
 
 
 class TrainOATTokWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+    include_keys = ['global_step', 'epoch', 'completed_optimizer_steps']
 
     def __init__(self, cfg: OmegaConf, output_dir=None, lazy_instantiation=True):
         super().__init__(cfg, output_dir=output_dir)
@@ -60,6 +59,40 @@ class TrainOATTokWorkspace(BaseWorkspace):
             self.optimizer = self.model.get_optimizer(**cfg.optimizer)
         self.global_step = 0
         self.epoch = 0
+        self.completed_optimizer_steps = 0
+
+    def _fit_preprocessing(self, dataset):
+        normalizer = dataset.get_normalizer()
+        self.model.set_normalizer(normalizer)
+        if self.ema_model is not None:
+            self.ema_model.set_normalizer(normalizer)
+
+    def _validation_metrics(self, tokenizer, batch):
+        return {"val_loss": tokenizer(batch).expand(batch["action"].shape[0])}
+
+    def _reconstruction_metrics(self, tokenizer, batch):
+        samples = batch["action"]
+        error = tokenizer.autoencode(samples=samples) - samples
+        return {"test_reconst_mse": error.square().flatten(1).mean(dim=1)}
+
+    @torch.inference_mode()
+    def _evaluate(self, tokenizer, dataloader, accelerator, measure, max_steps, description):
+        totals = {}
+        count = 0
+        for index, batch in enumerate(tqdm.tqdm(
+            dataloader, desc=f"{description} epoch {self.epoch}", leave=False,
+            disable=not accelerator.is_local_main_process,
+            mininterval=self.cfg.training.tqdm_interval_sec,
+        )):
+            batch = dict_apply(batch, lambda x: x.to(accelerator.device, non_blocking=True))
+            # Accelerate removes sampler duplicates in the final distributed batch.
+            metrics = accelerator.gather_for_metrics(measure(tokenizer, batch))
+            count += next(iter(metrics.values())).shape[0]
+            for name, values in metrics.items():
+                totals[name] = totals.get(name, 0) + values.sum(dtype=torch.float64)
+            if max_steps is not None and index + 1 >= max_steps:
+                break
+        return {name: (total / count).item() for name, total in totals.items()}
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
@@ -95,12 +128,7 @@ class TrainOATTokWorkspace(BaseWorkspace):
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
-
-        # configure normalizer
-        normalizer = dataset.get_normalizer()
-        self.model.set_normalizer(normalizer)
-        if cfg.training.use_ema:
-            self.ema_model.set_normalizer(normalizer)
+        lazy_eval = cfg.task.tokenizer.get("lazy_eval", False)
 
         # configure checkpoint
         if accelerator.is_main_process:
@@ -110,14 +138,27 @@ class TrainOATTokWorkspace(BaseWorkspace):
             )
 
         # resume training
-        if cfg.training.resume:
-            latest_ckpt_path = self.get_checkpoint_path()
-            if latest_ckpt_path.is_file():
-                accelerator.print(f"Resuming from checkpoint {latest_ckpt_path}")
-                self.load_checkpoint(path=latest_ckpt_path)
-                if self.epoch >= cfg.training.num_epochs:
-                    accelerator.print(f"Already trained for {self.epoch} epochs. Exiting.")
-                    return
+        latest_ckpt_path = self.get_checkpoint_path()
+        if cfg.training.resume and latest_ckpt_path.is_file():
+            accelerator.print(f"Resuming from checkpoint {latest_ckpt_path}")
+            saved = self.load_checkpoint(path=latest_ckpt_path, map_location="cpu")
+            # These checkpoints label the epoch and step that just finished.
+            self.epoch += 1
+            self.global_step += 1
+            if "completed_optimizer_steps" not in saved["pickles"]:
+                # The tokenizer's AdamW step counter is available in older checkpoints.
+                self.completed_optimizer_steps = max(
+                    (int(state.get("step", 0)) for state in self.optimizer.state.values()),
+                    default=0,
+                )
+            del saved
+            if accelerator.is_main_process:
+                topk_manager.restore_from_logs(os.path.join(self.output_dir, "logs.json"), self.epoch)
+            if self.epoch >= cfg.training.num_epochs:
+                accelerator.print(f"Already trained for {self.epoch} epochs. Exiting.")
+                return
+        else:
+            self._fit_preprocessing(dataset)
 
         # prepare with accelerator
         (
@@ -134,9 +175,12 @@ class TrainOATTokWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             self.ema_model = accelerator.prepare(self.ema_model)
             ema = hydra.utils.instantiate(cfg.ema, model=accelerator.unwrap_model(self.ema_model))
+            ema.optimization_step = self.completed_optimizer_steps
 
         # configure lr scheduler
         len_train_dataloader = len(train_dataloader)
+        if len_train_dataloader == 0:
+            raise ValueError("No training batches. Check the episode split, batch size and drop_last.")
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
@@ -146,7 +190,7 @@ class TrainOATTokWorkspace(BaseWorkspace):
                     // cfg.training.gradient_accumulate_every,
             # pytorch assumes stepping LRScheduler every epoch
             # however huggingface diffusers steps it every batch
-            last_epoch=self.global_step-1
+            last_epoch=self.completed_optimizer_steps-1
         )
 
         # configure logging
@@ -164,7 +208,8 @@ class TrainOATTokWorkspace(BaseWorkspace):
             })
 
         # training loop
-        with JsonLogger(os.path.join(self.output_dir, 'logs.json')) as json_logger:
+        log_path = os.path.join(self.output_dir, 'logs.json') if accelerator.is_main_process else None
+        with JsonLogger(log_path) as json_logger:
             while self.epoch < cfg.training.num_epochs:
 
                 if accelerator.is_main_process:
@@ -212,14 +257,17 @@ class TrainOATTokWorkspace(BaseWorkspace):
                             
                                 self.optimizer.step()
                                 self.optimizer.zero_grad(set_to_none=True)
-                                lr_scheduler.step()
-
-                                # update ema
-                                if cfg.training.use_ema:
-                                    ema.step(accelerator.unwrap_model(self.model))
+                                if not accelerator.optimizer_step_was_skipped:
+                                    lr_scheduler.step()
+                                    self.completed_optimizer_steps += 1
+                                    if cfg.training.use_ema:
+                                        ema.step(accelerator.unwrap_model(self.model))
 
                             # logging
-                            is_last_batch = (batch_idx == (len_train_dataloader-1))
+                            is_last_batch = batch_idx + 1 == len_train_dataloader or (
+                                cfg.training.max_train_steps is not None
+                                and batch_idx + 1 >= cfg.training.max_train_steps
+                            )
                             if accelerator.is_main_process:
                                 loss_cpu = loss.item()
                                 tepoch.set_postfix(loss=loss_cpu, refresh=False)
@@ -256,79 +304,21 @@ class TrainOATTokWorkspace(BaseWorkspace):
                     tokenizer = accelerator.unwrap_model(self.ema_model)
                 tokenizer.eval()
 
-                # run validation
-                if (self.epoch % cfg.training.val_every) == 0:
-                    loss_info = torch.zeros(2, device=device)   # [total loss, total batch_size]
-                    with torch.inference_mode():
-                        with tqdm.tqdm(
-                            val_dataloader, 
-                            desc=f"Validation epoch {self.epoch}",
-                            leave=False, 
-                            disable=not accelerator.is_local_main_process,
-                            mininterval=cfg.training.tqdm_interval_sec
-                        ) as tepoch:
-                            
-                            for batch_idx, batch in enumerate(tepoch):
-                                # device transfer
-                                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-
-                                # forward pass
-                                loss = tokenizer(batch).item()
-
-                                # log loss
-                                batch_size = batch['action'].shape[0]
-                                loss_info[0] += loss * batch_size
-                                loss_info[1] += batch_size
-
-                                # break if reach max val steps
-                                if (cfg.training.max_val_steps is not None) \
-                                    and batch_idx >= (cfg.training.max_val_steps-1):
-                                    break
-                    
-                    # logging
-                    accelerator.wait_for_everyone()
-                    loss_info = accelerator.reduce(loss_info, reduction='sum')
-                    accelerator.wait_for_everyone()
+                if not lazy_eval and self.epoch % cfg.training.val_every == 0:
+                    metrics = self._evaluate(
+                        tokenizer, val_dataloader, accelerator, self._validation_metrics,
+                        cfg.training.max_val_steps, "Validation",
+                    )
                     if accelerator.is_main_process:
-                        step_log['val_loss'] = (loss_info[0] / loss_info[1]).item()
+                        step_log.update(metrics)
 
-                # reconstruction eval
-                if self.epoch % cfg.training.sample_every == 0:
-                    loss_info = torch.zeros(2, device=device)   # [total loss, total batch_size]
-                    with torch.inference_mode():
-                        with tqdm.tqdm(
-                            val_dataloader, 
-                            desc=f"Reconstruction epoch {self.epoch}",
-                            leave=False, 
-                            disable=not accelerator.is_local_main_process,
-                            mininterval=cfg.training.tqdm_interval_sec
-                        ) as tepoch:
-
-                            for batch_idx, batch in enumerate(tepoch):
-                                # device transfer
-                                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-
-                                # reconstruction
-                                samples = batch['action']
-                                reconst_samples = tokenizer.autoencode(samples=samples)
-                                mse = F.mse_loss(reconst_samples, samples).item()
-
-                                # log loss
-                                batch_size = samples.shape[0]
-                                loss_info[0] += mse * batch_size
-                                loss_info[1] += batch_size
-
-                                # early stop if reach max samples
-                                if (cfg.training.max_reconst_steps is not None) \
-                                    and batch_idx >= (cfg.training.max_reconst_steps-1):
-                                    break
-                    
-                    # logging
-                    accelerator.wait_for_everyone()
-                    loss_info = accelerator.reduce(loss_info, reduction='sum')
-                    accelerator.wait_for_everyone()
+                if not lazy_eval and self.epoch % cfg.training.sample_every == 0:
+                    metrics = self._evaluate(
+                        tokenizer, val_dataloader, accelerator, self._reconstruction_metrics,
+                        cfg.training.max_reconst_steps, "Reconstruction",
+                    )
                     if accelerator.is_main_process:
-                        step_log['test_reconst_mse'] = (loss_info[0] / loss_info[1]).item()
+                        step_log.update(metrics)
 
                 # checkpoint
                 if accelerator.is_main_process and (self.epoch % cfg.training.checkpoint_every) == 0:
@@ -379,12 +369,38 @@ class TrainOATTokWorkspace(BaseWorkspace):
 
 
 
+class TrainPRTWorkspace(TrainOATTokWorkspace):
+    """Fit the command predictor on training episodes and score decoded actions."""
+
+    def _fit_preprocessing(self, dataset):
+        weights, scales = dataset.fit_prior(**self.cfg.prior_fit)
+        self.model.set_prior_statistics(weights, scales)
+        if self.ema_model is not None:
+            self.ema_model.set_prior_statistics(weights, scales)
+
+    def _validation_metrics(self, tokenizer, batch):
+        return {"val_loss": tokenizer.loss_per_sample(batch)}
+
+    def _reconstruction_metrics(self, tokenizer, batch):
+        actions = batch["action"]
+        decoded = tokenizer.autoencode(actions, batch["past_action"])
+        squared_error = (decoded - actions).square()
+        arm_error = squared_error[:, :, :6]
+        grip_correct = decoded[:, :, 6] == actions[:, :, 6]
+        return {
+            "test_reconst_mse": squared_error.mean(dim=(1, 2)),
+            "val_arm_mse": arm_error.mean(dim=(1, 2)),
+            "val_arm_prefix_mse": arm_error[:, :tokenizer.execution_steps].mean(dim=(1, 2)),
+            "val_grip_chunk_accuracy": grip_correct.all(dim=1).float(),
+        }
+
+
 @hydra.main(
     version_base=None,
     config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
     config_name=pathlib.Path(__file__).stem)
 def main(cfg):
-    workspace = TrainOATTokWorkspace(cfg)
+    workspace = hydra.utils.get_class(cfg._target_)(cfg)
     workspace.run()
 
 if __name__ == "__main__":
