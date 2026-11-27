@@ -3,9 +3,12 @@
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from oat.common.replay_buffer import ReplayBuffer
 from oat.common.seq_sampler import get_val_mask
+from oat.dataset.base_dataset import make_train_validation_datasets
+from oat.dataset.prt_dataset import PRTDataset
 from oat.dataset.zarr_dataset import ZarrDataset
 from oat.dataset.zarr_dataset_with_past import ZarrDatasetWithPastAction
 from oat.dataset.zarr_dataset_with_prev_window import ZarrDatasetWithPrevWindow
@@ -131,3 +134,36 @@ def test_no_holdout_preserves_all_data_fit_even_from_empty_validation_view(
     for view in (dataset, validation):
         assert_training_statistics(view.get_normalizer(mode=mode), episodes,
                                    dataset.train_mask, dataset.obs_keys, mode)
+
+
+@pytest.mark.parametrize("dataset_type", [PRTDataset, ZarrDatasetWithPrevWindow])
+def test_separate_validation_store_uses_all_its_episodes(make_store, dataset_type):
+    train_path, train_episodes = make_store(holdout_value=0.0)
+    validation_path, validation_episodes = make_store(holdout_value=5_000.0)
+    settings = dict(zarr_path=train_path, action_key=ACTION_KEY, past_n=2,
+                    seed=SEED, val_ratio=VAL_RATIO, max_train_episodes=2)
+    if dataset_type is PRTDataset:
+        settings["horizon"] = 1
+    else:
+        settings.update(n_action_steps=1, n_exec_steps=1, n_obs_steps=1, obs_keys=["state"])
+    task = OmegaConf.create({
+        "dataset": {"_target_": f"{dataset_type.__module__}.{dataset_type.__name__}", **settings},
+        "validation_zarr_path": validation_path,
+    })
+    train, validation = make_train_validation_datasets(task)
+    assert train.train_mask.sum() == 2
+    assert validation.train_mask.all()
+    expected_actions = np.concatenate([ep[ACTION_KEY] for ep in validation_episodes])
+    actual_actions = np.stack([validation[i]["action"][0].numpy() for i in range(len(validation))])
+    np.testing.assert_array_equal(actual_actions, expected_actions)
+    if dataset_type is PRTDataset:
+        reference = PRTDataset(**{**settings, "val_ratio": 0.0})
+        for actual, expected in zip(train.fit_prior(), reference.fit_prior()):
+            torch.testing.assert_close(actual, expected)
+    else:
+        assert_training_statistics(train.get_normalizer(), train_episodes,
+                                   train.train_mask, ["state"], mode="limits")
+
+    task.validation_zarr_path = train_path
+    with pytest.raises(ValueError, match="separate validation store"):
+        make_train_validation_datasets(task)

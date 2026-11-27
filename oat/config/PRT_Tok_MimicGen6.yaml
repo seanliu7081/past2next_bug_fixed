@@ -1,0 +1,20 @@
+defaults:
+  - PRT_Tok
+  - _self_
+
+name: PRT_Tok_MimicGen6
+
+task:
+  tokenizer:
+    name: mimicgen6
+    lazy_eval: false
+    validation_zarr_path: data/mimicgen/mimicgen6_val.zarr
+    dataset:
+      zarr_path: data/mimicgen/mimicgen6_N50.zarr
+      val_ratio: 0.0
+
+training:
+  num_demo: 300
+
+logging:
+  mode: online

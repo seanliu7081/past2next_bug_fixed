@@ -30,7 +30,7 @@ from accelerate.utils import (
 from typing import Union
 
 from oat.workspace.base_workspace import BaseWorkspace
-from oat.dataset.base_dataset import BaseDataset
+from oat.dataset.base_dataset import make_train_validation_datasets
 from oat.env_runner.base_runner import BaseRunner
 from oat.env_runner.p2n_new_convnext_libero10_runner import renderer_env
 from oat.env_runner.p2n_vla_rollout import close_runner, resolve_renderer
@@ -363,6 +363,9 @@ class TrainPolicyWorkspace(BaseWorkspace):
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
+        cpu_threads = cfg.training.get("torch_num_threads")
+        if cpu_threads is not None:
+            torch.set_num_threads(cpu_threads)
         init_checkpoint = cfg.training.get("init_checkpoint")
         if init_checkpoint and cfg.training.resume:
             raise ValueError("Fine-tuning with init_checkpoint requires training.resume=false")
@@ -406,10 +409,8 @@ class TrainPolicyWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
         # configure dataset
-        dataset: BaseDataset = hydra.utils.instantiate(
-            cfg.task.policy.dataset)
+        dataset, val_dataset = make_train_validation_datasets(cfg.task.policy)
         train_dataloader = self._make_training_dataloader(dataset, cfg.dataloader)
-        val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
         dataset_split = self._offline_validation_metadata(
             dataset, val_dataset, cfg.training, train_dataloader, val_dataloader)

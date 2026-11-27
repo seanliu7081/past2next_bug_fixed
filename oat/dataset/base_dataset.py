@@ -1,3 +1,4 @@
+import hydra
 import numpy as np
 import os
 import tqdm
@@ -6,6 +7,26 @@ import time
 import torch
 from typing import Dict, Optional
 from oat.model.common.normalizer import LinearNormalizer
+
+
+def make_train_validation_datasets(task):
+    """Use the usual episode split or reserve an entire separate Zarr for validation."""
+    config = task.dataset
+    validation_path = task.get("validation_zarr_path")
+    if validation_path is None:
+        train = hydra.utils.instantiate(config)
+        return train, train.get_validation_dataset()
+
+    if not validation_path or os.path.realpath(validation_path) == os.path.realpath(config.zarr_path):
+        raise ValueError("validation_zarr_path must identify a separate validation store")
+    train = hydra.utils.instantiate(config, val_ratio=0.0)
+    validation = hydra.utils.instantiate(
+        config, zarr_path=validation_path, val_ratio=0.0, max_train_episodes=None,
+    )
+    if not len(validation):
+        raise ValueError(f"No validation windows in {validation_path}")
+    return train, validation
+
 
 class BaseDataset(torch.utils.data.Dataset):
     def get_validation_dataset(self) -> 'BaseDataset':

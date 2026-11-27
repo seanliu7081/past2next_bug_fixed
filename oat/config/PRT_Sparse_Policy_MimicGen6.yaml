@@ -1,0 +1,45 @@
+defaults:
+  - PRT_Sparse_Policy
+  - _self_
+
+name: PRT_Sparse_Policy_MimicGen6
+
+policy:
+  sparse_decode_batch_size: 512
+
+task:
+  policy:
+    name: mimicgen6
+    task_name: mimicgen6
+    # stack-three-d1, hammer-cleanup-d1, mug-cleanup-d1, coffee-d2, square-d2, threading-d2
+    task_uids: [0, 1, 2, 3, 4, 5]
+    lazy_eval: false
+    # Replace the full inherited LIBERO runner, including its simulator settings.
+    env_runner: ${.rollout}
+    rollout:
+      _target_: oat.env_runner.mimicgen_runner.MimicGenRunner
+      task_names: [stack_three_d1, hammer_cleanup_d1, mug_cleanup_d1, coffee_d2, square_d2, threading_d2]
+      n_per_task: 50
+      n_parallel_envs: 4
+      n_obs_steps: ${n_obs_steps}
+      n_action_steps: ${n_action_steps}
+      image_size: 128
+      seed: ${seed}
+    validation_zarr_path: data/mimicgen/mimicgen6_val.zarr
+    dataset:
+      zarr_path: data/mimicgen/mimicgen6_N50.zarr
+      val_ratio: 0.0
+
+training:
+  num_demo: 300
+  rollout_every: 50
+  torch_num_threads: 4
+
+logging:
+  mode: online
+
+checkpoint:
+  topk:
+    monitor_key: val_loss
+    mode: min
+    format_str: 'ep-{epoch:04d}_val-loss-{val_loss:.6f}.ckpt'

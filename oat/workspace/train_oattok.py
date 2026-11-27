@@ -21,7 +21,7 @@ from accelerate.utils import (
 from typing import Union
 
 from oat.workspace.base_workspace import BaseWorkspace
-from oat.dataset.base_dataset import BaseDataset
+from oat.dataset.base_dataset import make_train_validation_datasets
 from oat.common.checkpoint_util import TopKCheckpointManager
 from oat.common.json_logger import JsonLogger
 from oat.common.pytorch_util import dict_apply
@@ -123,10 +123,8 @@ class TrainOATTokWorkspace(BaseWorkspace):
         torch_generator = get_generator(seed=seed, device=device)
         
         # configure dataset
-        dataset: BaseDataset = hydra.utils.instantiate(
-            cfg.task.tokenizer.dataset)
+        dataset, val_dataset = make_train_validation_datasets(cfg.task.tokenizer)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
-        val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
         lazy_eval = cfg.task.tokenizer.get("lazy_eval", False)
 
